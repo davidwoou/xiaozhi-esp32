@@ -14,6 +14,7 @@
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
 #include <wifi_station.h>
+#include <ssid_manager.h>
 #include "power_manager.h"
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
@@ -78,6 +79,9 @@ public:
 
 class ZhengchenCamBoard : public WifiBoard {
 private:
+    static constexpr const char* kDefaultWifiSsid = "David-Wifi";
+    static constexpr const char* kDefaultWifiPassword = "david850915";
+
     i2c_master_bus_handle_t i2c_bus_;
     i2c_master_dev_handle_t pca9557_handle_;
     Button boot_button_;
@@ -87,6 +91,22 @@ private:
     Pca9557* pca9557_;
     Esp32Camera* camera_;
     PowerManager* power_manager_ = new PowerManager(GPIO_NUM_47);
+
+    void EnsureDefaultWifiCredentials() {
+        auto& ssid_manager = SsidManager::GetInstance();
+        ssid_manager.AddSsid(kDefaultWifiSsid, kDefaultWifiPassword);
+
+        const auto& ssid_list = ssid_manager.GetSsidList();
+        for (size_t i = 0; i < ssid_list.size(); ++i) {
+            if (ssid_list[i].ssid == kDefaultWifiSsid) {
+                if (i > 0) {
+                    ssid_manager.SetDefaultSsid(static_cast<int>(i));
+                }
+                break;
+            }
+        }
+        ESP_LOGI(TAG, "Ensured default Wi-Fi SSID is present and prioritized: %s", kDefaultWifiSsid);
+    }
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -279,6 +299,7 @@ public:
     boot_button_(BOOT_BUTTON_GPIO),
     volume_up_button_(VOLUME_UP_BUTTON_GPIO),
     volume_down_button_(VOLUME_DOWN_BUTTON_GPIO) {
+        EnsureDefaultWifiCredentials();
         InitializeI2c();
         InitializeSpi();
         InitializeSt7789Display();

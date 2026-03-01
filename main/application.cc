@@ -350,7 +350,29 @@ void Application::Run() {
     }
 }
 
+void Application::RefreshCountdownOverlay() {
+    auto display = Board::GetInstance().GetDisplay();
+    if (alarm_service_.IsRinging()) {
+        last_countdown_ui_second_ = -1;
+        display->HideCountdownOverlay();
+        return;
+    }
+
+    auto countdown = alarm_service_.GetCountdown();
+    if (!countdown.has_value() || !countdown->active) {
+        last_countdown_ui_second_ = -1;
+        display->HideCountdownOverlay();
+        return;
+    }
+
+    auto overlay_primary = BuildCountdownOverlayPrimary(*countdown);
+    auto overlay_secondary = BuildCountdownOverlaySecondary(*countdown);
+    display->ShowCountdownOverlay(overlay_primary.c_str(), overlay_secondary.c_str(), IsCountdownUrgent(*countdown));
+    last_countdown_ui_second_ = countdown->remaining_seconds;
+}
+
 void Application::RefreshIdleDisplay() {
+    RefreshCountdownOverlay();
     if (GetDeviceState() != kDeviceStateIdle) {
         return;
     }
@@ -358,7 +380,6 @@ void Application::RefreshIdleDisplay() {
     auto display = Board::GetInstance().GetDisplay();
     if (alarm_service_.IsRinging()) {
         last_countdown_ui_second_ = -1;
-        display->HideCountdownOverlay();
         if (alarm_service_.IsCountdownRinging()) {
             if (auto countdown = alarm_service_.GetCountdown(); countdown.has_value()) {
                 auto message = BuildCountdownMessage(*countdown);
@@ -377,21 +398,38 @@ void Application::RefreshIdleDisplay() {
         return;
     }
 
-    if (auto countdown = alarm_service_.GetCountdown(); countdown.has_value() && countdown->active) {
-        auto status = BuildActiveCountdownStatus(*countdown);
-        auto message = BuildActiveCountdownMessage(*countdown);
-        auto overlay_primary = BuildCountdownOverlayPrimary(*countdown);
-        auto overlay_secondary = BuildCountdownOverlaySecondary(*countdown);
-        display->SetStatus(status.c_str());
+    if (IsMusicPlaying()) {
+        auto* music_status = GetMusicStatusJson();
+        auto* name_json = cJSON_GetObjectItem(music_status, "name");
+        auto* url_json = cJSON_GetObjectItem(music_status, "url");
+        std::string track_name;
+        if (cJSON_IsString(name_json) && name_json->valuestring != nullptr && std::strlen(name_json->valuestring) > 0) {
+            track_name = name_json->valuestring;
+        } else if (cJSON_IsString(url_json) && url_json->valuestring != nullptr) {
+            track_name = url_json->valuestring;
+        }
+        cJSON_Delete(music_status);
+
+        display->SetStatus("Music");
         display->SetEmotion("neutral");
-        display->SetChatMessage("system", message.c_str());
-        display->ShowCountdownOverlay(overlay_primary.c_str(), overlay_secondary.c_str(), IsCountdownUrgent(*countdown));
-        last_countdown_ui_second_ = countdown->remaining_seconds;
+        if (track_name.empty()) {
+            display->SetChatMessage("system", "正在播放");
+        } else {
+            std::string message = std::string("正在播放：") + track_name;
+            display->SetChatMessage("system", message.c_str());
+        }
         return;
     }
 
-    last_countdown_ui_second_ = -1;
-    display->HideCountdownOverlay();
+    if (auto countdown = alarm_service_.GetCountdown(); countdown.has_value() && countdown->active) {
+        auto status = BuildActiveCountdownStatus(*countdown);
+        auto message = BuildActiveCountdownMessage(*countdown);
+        display->SetStatus(status.c_str());
+        display->SetEmotion("neutral");
+        display->SetChatMessage("system", message.c_str());
+        return;
+    }
+
     if (auto next_alarm = alarm_service_.GetNextAlarm(); next_alarm.has_value()) {
         auto message = BuildNextAlarmMessage(*next_alarm);
         display->SetChatMessage("system", message.c_str());
@@ -638,8 +676,36 @@ void Application::InitializeProtocol() {
     });
     
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        if (GetDeviceState() == kDeviceStateSpeaking) {
-            audio_service_.PushPacketToDecodeQueue(std::move(packet));
+        auto state = GetDeviceState();
+        if (state == kDeviceStateSpeaking) {
+            audio_service_.PushPacketToDecodeQueue(std::move(packet), true);
+            return;
+        }
+
+        if (state != kDeviceStateListening && state != kDeviceStateConnecting) {
+            return;
+        }
+
+        bool should_switch_to_speaking = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (pending_tts_audio_packets_.size() >= 8) {
+                pending_tts_audio_packets_.pop_front();
+            }
+            pending_tts_audio_packets_.push_back(std::move(packet));
+            if (!pending_tts_state_switch_) {
+                pending_tts_state_switch_ = true;
+                should_switch_to_speaking = true;
+            }
+        }
+
+        if (should_switch_to_speaking) {
+            Schedule([this]() {
+                auto current_state = GetDeviceState();
+                if (current_state == kDeviceStateListening || current_state == kDeviceStateConnecting) {
+                    SetDeviceState(kDeviceStateSpeaking);
+                }
+            });
         }
     });
     
@@ -985,6 +1051,8 @@ void Application::HandleWakeWordDetectedEvent() {
         return;
     }
 
+    McpServer::GetInstance().OnWakeWordInterruption();
+
     if (!protocol_) {
         return;
     }
@@ -1071,7 +1139,7 @@ void Application::HandleStateChangedEvent() {
     auto display = board.GetDisplay();
     auto led = board.GetLed();
     led->OnStateChanged();
-    if (new_state != kDeviceStateIdle) {
+    if (new_state != kDeviceStateIdle && !alarm_service_.HasActiveCountdown()) {
         last_countdown_ui_second_ = -1;
         display->HideCountdownOverlay();
     }
@@ -1079,6 +1147,7 @@ void Application::HandleStateChangedEvent() {
     switch (new_state) {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
+            ClearPendingTtsAudioPackets();
             display->SetStatus(Lang::Strings::STANDBY);
             display->ClearChatMessages();  // Clear messages first
             display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
@@ -1131,6 +1200,7 @@ void Application::HandleStateChangedEvent() {
                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
             }
             audio_service_.ResetDecoder();
+            FlushPendingTtsAudioPackets();
             break;
         case kDeviceStateWifiConfiguring:
             audio_service_.EnableVoiceProcessing(false);
@@ -1139,6 +1209,10 @@ void Application::HandleStateChangedEvent() {
         default:
             // Do nothing
             break;
+    }
+
+    if (new_state != kDeviceStateIdle && alarm_service_.HasActiveCountdown() && !alarm_service_.IsRinging()) {
+        RefreshCountdownOverlay();
     }
 }
 
@@ -1174,37 +1248,78 @@ void Application::HandleClockTickEvent() {
         audio_service_.ResetDecoder();
         DismissAlert();
         RefreshIdleDisplay();
-    } else if (GetDeviceState() == kDeviceStateIdle && alarm_service_.HasActiveCountdown()) {
+    } else if (alarm_service_.HasActiveCountdown()) {
         auto countdown = alarm_service_.GetCountdown();
         if (countdown.has_value() && countdown->active) {
+            bool is_idle = GetDeviceState() == kDeviceStateIdle;
             bool second_changed = countdown->remaining_seconds != last_countdown_ui_second_;
-            if (countdown->remaining_seconds > 0 &&
+            if (is_idle &&
+                countdown->remaining_seconds > 0 &&
                 countdown->remaining_seconds <= 10 &&
                 countdown->remaining_seconds != last_countdown_tick_second_) {
                 last_countdown_tick_second_ = countdown->remaining_seconds;
                 if (audio_service_.IsIdle()) {
                     audio_service_.PlaySound(Lang::Sounds::OGG_COUNTDOWN_TICK);
                 }
+            } else if (!is_idle) {
+                last_countdown_tick_second_ = -1;
             }
             if (second_changed) {
-                RefreshIdleDisplay();
+                if (is_idle) {
+                    RefreshIdleDisplay();
+                } else {
+                    RefreshCountdownOverlay();
+                }
             }
         } else {
             last_countdown_tick_second_ = -1;
             last_countdown_ui_second_ = -1;
-            RefreshIdleDisplay();
+            if (GetDeviceState() == kDeviceStateIdle) {
+                RefreshIdleDisplay();
+            } else {
+                RefreshCountdownOverlay();
+            }
         }
-    } else if (!alarm_service_.HasActiveCountdown()) {
+    } else {
         last_countdown_tick_second_ = -1;
         if (last_countdown_ui_second_ != -1) {
             last_countdown_ui_second_ = -1;
-            RefreshIdleDisplay();
+            if (GetDeviceState() == kDeviceStateIdle) {
+                RefreshIdleDisplay();
+            } else {
+                RefreshCountdownOverlay();
+            }
         }
     }
+
+    McpServer::GetInstance().OnClockTick();
 
     if (clock_ticks_ % 10 == 0) {
         SystemInfo::PrintHeapStats();
     }
+}
+
+void Application::FlushPendingTtsAudioPackets() {
+    std::deque<std::unique_ptr<AudioStreamPacket>> packets;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        packets = std::move(pending_tts_audio_packets_);
+        pending_tts_state_switch_ = false;
+    }
+
+    while (!packets.empty()) {
+        auto packet = std::move(packets.front());
+        packets.pop_front();
+        if (packet) {
+            audio_service_.PushPacketToDecodeQueue(std::move(packet), true);
+        }
+    }
+}
+
+void Application::ClearPendingTtsAudioPackets() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pending_tts_audio_packets_.clear();
+    pending_tts_state_switch_ = false;
 }
 
 void Application::Schedule(std::function<void()>&& callback) {
@@ -1388,7 +1503,7 @@ void Application::SetAecMode(AecMode mode) {
     });
 }
 
-bool Application::PlayMusicUrl(const std::string& url) {
+bool Application::PlayMusicUrl(const std::string& url, const std::string& track_name) {
     if (url.empty()) {
         return false;
     }
@@ -1411,8 +1526,10 @@ bool Application::PlayMusicUrl(const std::string& url) {
         SetDeviceState(kDeviceStateIdle);
     }
 
+    ClearPendingTtsAudioPackets();
+    audio_service_.EnableWakeWordDetection(true);
     audio_service_.ResetDecoder();
-    bool started = url_audio_player_.Play(url);
+    bool started = url_audio_player_.Play(url, track_name);
     if (started) {
         RefreshIdleDisplay();
     }

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cctype>
 #include <climits>
+#include <cstddef>
 #include <cstring>
 #include <esp_pthread.h>
 
@@ -34,6 +35,19 @@ struct CustomMusicItem {
 
 std::vector<CustomMusicItem> g_custom_music_catalog;
 std::optional<CustomMusicItem> g_current_custom_music;
+
+struct MusicSessionState {
+    std::vector<CustomMusicItem> playlist;
+    std::vector<size_t> history;
+    int current_index = -1;
+    bool mode_active = false;
+    bool paused = false;
+    bool expected_stop = false;
+    bool last_playing = false;
+    std::string last_error;
+};
+
+MusicSessionState g_music_session;
 
 int SafeSizeToInt(size_t value) {
     if (value > static_cast<size_t>(INT_MAX)) {
@@ -170,11 +184,168 @@ std::vector<std::string> ParseIdList(const std::string& raw_id_list) {
     return ids;
 }
 
+bool IsPlayableHttpUrl(const std::string& url) {
+    return url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0;
+}
+
+bool StartPlaylistTrackByIndex(size_t index, bool enter_mode, bool append_history, std::string* error_message = nullptr) {
+    if (index >= g_music_session.playlist.size()) {
+        if (error_message != nullptr) {
+            *error_message = "Track index out of range";
+        }
+        return false;
+    }
+
+    auto& app = Application::GetInstance();
+    if (app.IsMusicPlaying()) {
+        g_music_session.expected_stop = true;
+    }
+
+    const auto selected = g_music_session.playlist[index];
+    if (!app.PlayMusicUrl(selected.url, selected.music_name)) {
+        g_music_session.expected_stop = false;
+        if (error_message != nullptr) {
+            *error_message = "Failed to start playback for selected track";
+        }
+        return false;
+    }
+
+    g_music_session.expected_stop = false;
+    g_music_session.current_index = static_cast<int>(index);
+    g_music_session.paused = false;
+    if (enter_mode) {
+        g_music_session.mode_active = true;
+    }
+    if (append_history && (g_music_session.history.empty() || g_music_session.history.back() != index)) {
+        g_music_session.history.push_back(index);
+    }
+    if (g_music_session.history.size() > 128) {
+        size_t overflow = g_music_session.history.size() - 128;
+        g_music_session.history.erase(g_music_session.history.begin(), g_music_session.history.begin() + overflow);
+    }
+    g_music_session.last_playing = true;
+    g_music_session.last_error.clear();
+    g_current_custom_music = selected;
+    return true;
+}
+
+bool StopMusicForSession(bool exit_mode, bool paused) {
+    auto& app = Application::GetInstance();
+    bool stopped = false;
+    if (app.IsMusicPlaying()) {
+        g_music_session.expected_stop = true;
+        stopped = app.StopMusic();
+    }
+    if (exit_mode) {
+        g_music_session.mode_active = false;
+    }
+    g_music_session.paused = paused;
+    return stopped;
+}
+
+std::vector<CustomMusicItem> FilterCatalogByKeyword(const std::string& music_name, const std::string& author_name) {
+    std::vector<CustomMusicItem> result;
+    for (const auto& item : g_custom_music_catalog) {
+        if (!ContainsIgnoreCase(item.music_name, music_name)) {
+            continue;
+        }
+        if (!author_name.empty() && !ContainsIgnoreCase(item.author_name, author_name)) {
+            continue;
+        }
+        result.push_back(item);
+    }
+    return result;
+}
+
+std::vector<CustomMusicItem> BuildPlaylistFromIdList(const std::vector<std::string>& id_list, const std::string& requested_name) {
+    std::vector<CustomMusicItem> candidates;
+    candidates.reserve(id_list.size());
+    for (const auto& id : id_list) {
+        auto* item = FindCustomMusicById(id);
+        if (item == nullptr) {
+            continue;
+        }
+        if (!requested_name.empty() && !ContainsIgnoreCase(item->music_name, requested_name)) {
+            continue;
+        }
+        candidates.push_back(*item);
+    }
+    return candidates;
+}
+
+int FindFirstMatchIndex(const std::vector<CustomMusicItem>& playlist, const std::string& keyword) {
+    for (size_t i = 0; i < playlist.size(); ++i) {
+        if (ContainsIgnoreCase(playlist[i].music_name, keyword)) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+std::string NormalizeMusicControlAction(const std::string& raw_action) {
+    auto action = ToLowerAsciiCopy(TrimCopy(raw_action));
+    if (action.empty()) {
+        return action;
+    }
+
+    if (action == "pause" || action == "暂停") {
+        return "pause";
+    }
+    if (action == "resume" || action == "continue" || action == "继续" || action == "恢复") {
+        return "resume";
+    }
+    if (action == "next" || action == "下一首" || action == "下一曲") {
+        return "next";
+    }
+    if (action == "prev" || action == "previous" || action == "上一首" || action == "上一曲") {
+        return "prev";
+    }
+    if (action == "play_index" || action == "按序号播放") {
+        return "play_index";
+    }
+    if (action == "play_name" || action == "按名称播放") {
+        return "play_name";
+    }
+    if (action == "status" || action == "状态") {
+        return "status";
+    }
+    if (action == "exit" || action == "stop" || action == "退出" || action == "退出音乐模式") {
+        return "exit";
+    }
+    if (action == "enter_dialog" || action == "dialog" || action == "chat" ||
+        action == "进入对话模式" || action == "进入聊天模式") {
+        return "enter_dialog";
+    }
+
+    return action;
+}
+
+cJSON* BuildMusicSessionJson() {
+    auto* root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "mode_active", g_music_session.mode_active);
+    cJSON_AddBoolToObject(root, "paused", g_music_session.paused);
+    cJSON_AddNumberToObject(root, "playlist_size", SafeSizeToInt(g_music_session.playlist.size()));
+    cJSON_AddNumberToObject(root, "history_size", SafeSizeToInt(g_music_session.history.size()));
+    cJSON_AddNumberToObject(root, "current_index", g_music_session.current_index);
+    cJSON_AddNumberToObject(root, "current_position", g_music_session.current_index >= 0 ? g_music_session.current_index + 1 : 0);
+    cJSON_AddBoolToObject(root, "expected_stop", g_music_session.expected_stop);
+    if (!g_music_session.last_error.empty()) {
+        cJSON_AddStringToObject(root, "last_error", g_music_session.last_error.c_str());
+    }
+    if (g_music_session.current_index >= 0 &&
+        static_cast<size_t>(g_music_session.current_index) < g_music_session.playlist.size()) {
+        cJSON_AddItemToObject(root, "current_track",
+            BuildCustomMusicJson(g_music_session.playlist[static_cast<size_t>(g_music_session.current_index)]));
+    }
+    return root;
+}
+
 void AddCustomMusicMetaToJson(cJSON* root) {
     if (root == nullptr) {
         return;
     }
     cJSON_AddNumberToObject(root, "custom_music_catalog_size", SafeSizeToInt(g_custom_music_catalog.size()));
+    cJSON_AddItemToObject(root, "music_session", BuildMusicSessionJson());
     if (g_current_custom_music.has_value()) {
         cJSON_AddItemToObject(root, "current_custom_music", BuildCustomMusicJson(g_current_custom_music.value()));
     }
@@ -203,6 +374,72 @@ McpServer::~McpServer() {
         delete tool;
     }
     tools_.clear();
+}
+
+void McpServer::OnClockTick() {
+    auto& app = Application::GetInstance();
+    bool playing = app.IsMusicPlaying();
+    if (playing) {
+        g_music_session.last_playing = true;
+        return;
+    }
+
+    if (!g_music_session.last_playing) {
+        return;
+    }
+    g_music_session.last_playing = false;
+
+    if (g_music_session.expected_stop) {
+        g_music_session.expected_stop = false;
+        return;
+    }
+
+    auto* status = app.GetMusicStatusJson();
+    auto* state_json = cJSON_GetObjectItem(status, "state");
+    auto* error_json = cJSON_GetObjectItem(status, "last_error");
+    std::string state = cJSON_IsString(state_json) && state_json->valuestring != nullptr ? state_json->valuestring : "";
+    std::string error = cJSON_IsString(error_json) && error_json->valuestring != nullptr ? error_json->valuestring : "";
+    cJSON_Delete(status);
+
+    if (state == "error") {
+        g_music_session.last_error = error.empty() ? "Track playback failed" : error;
+        g_music_session.paused = false;
+        return;
+    }
+
+    if (!g_music_session.mode_active || g_music_session.paused || g_music_session.playlist.empty() ||
+        g_music_session.current_index < 0 || static_cast<size_t>(g_music_session.current_index) >= g_music_session.playlist.size()) {
+        return;
+    }
+
+    size_t current_index = static_cast<size_t>(g_music_session.current_index);
+    size_t next_index = current_index + 1;
+    if (next_index >= g_music_session.playlist.size()) {
+        g_music_session.mode_active = false;
+        g_music_session.paused = false;
+        Application::GetInstance().RefreshIdleDisplay();
+        return;
+    }
+
+    std::string error_message;
+    if (!StartPlaylistTrackByIndex(next_index, true, true, &error_message)) {
+        g_music_session.last_error = error_message.empty() ? "Failed to auto play next track" : error_message;
+    }
+}
+
+void McpServer::OnWakeWordInterruption() {
+    auto& app = Application::GetInstance();
+    bool is_playing = app.IsMusicPlaying();
+    if (!is_playing && !g_music_session.mode_active) {
+        return;
+    }
+
+    g_music_session.mode_active = false;
+    g_music_session.paused = is_playing;
+    if (is_playing) {
+        g_music_session.expected_stop = true;
+        app.StopMusic();
+    }
 }
 
 void McpServer::AddCommonTools() {
@@ -310,10 +547,10 @@ void McpServer::AddCommonTools() {
         });
 
     AddTool("self.music.play",
-        "Play a direct URL audio file from local MCP on the device. Supports wav/mp3/ogg URLs. "
-        "Streaming playback is reserved for future support and currently not available.",
+        "Play one direct URL track and enter music mode. Supports http/https mp3/wav/ogg URLs.",
         PropertyList({
             Property("url", kPropertyTypeString),
+            Property("name", kPropertyTypeString, std::string("")),
             Property("streaming", kPropertyTypeBoolean, false)
         }),
         [](const PropertyList& properties) -> ReturnValue {
@@ -321,12 +558,31 @@ void McpServer::AddCommonTools() {
                 throw std::runtime_error("Streaming playback is reserved and not implemented yet");
             }
 
-            auto& app = Application::GetInstance();
-            if (!app.PlayMusicUrl(properties["url"].value<std::string>())) {
-                throw std::runtime_error("Failed to start local URL music playback");
+            auto url = TrimCopy(properties["url"].value<std::string>());
+            if (!IsPlayableHttpUrl(url)) {
+                throw std::runtime_error("url must start with http:// or https://");
             }
-            g_current_custom_music.reset();
 
+            CustomMusicItem item;
+            item.id = "direct_url_1";
+            item.music_name = TrimCopy(properties["name"].value<std::string>());
+            if (item.music_name.empty()) {
+                item.music_name = url;
+            }
+            item.url = url;
+
+            g_music_session.playlist = {item};
+            g_music_session.history.clear();
+            g_music_session.current_index = -1;
+            g_music_session.paused = false;
+            g_music_session.last_error.clear();
+
+            std::string error_message;
+            if (!StartPlaylistTrackByIndex(0, true, true, &error_message)) {
+                throw std::runtime_error(error_message.empty() ? "Failed to start local URL music playback" : error_message);
+            }
+
+            auto& app = Application::GetInstance();
             auto* root = cJSON_CreateObject();
             cJSON_AddItemToObject(root, "music", app.GetMusicStatusJson());
             AddCustomMusicMetaToJson(root);
@@ -338,10 +594,7 @@ void McpServer::AddCommonTools() {
         PropertyList(),
         [](const PropertyList& properties) -> ReturnValue {
             auto& app = Application::GetInstance();
-            bool stopped = app.StopMusic();
-            if (stopped) {
-                g_current_custom_music.reset();
-            }
+            bool stopped = StopMusicForSession(true, false);
 
             auto* root = cJSON_CreateObject();
             cJSON_AddBoolToObject(root, "stopped", stopped);
@@ -380,7 +633,7 @@ void McpServer::AddCommonTools() {
                 music_item.music_name = GetJsonStringByKeys(item, {"music_name", "name", "title"});
                 music_item.author_name = GetJsonStringByKeys(item, {"author_name", "author", "artist"});
                 music_item.url = GetJsonStringByKeys(item, {"url", "play_url", "audio_url"});
-                if (music_item.id.empty() || music_item.music_name.empty() || music_item.url.empty()) {
+                if (music_item.id.empty() || music_item.music_name.empty() || music_item.url.empty() || !IsPlayableHttpUrl(music_item.url)) {
                     ++skipped;
                     continue;
                 }
@@ -420,13 +673,8 @@ void McpServer::AddCommonTools() {
             cJSON_AddNumberToObject(root, "catalog_size", SafeSizeToInt(g_custom_music_catalog.size()));
 
             auto* result_list = cJSON_CreateArray();
-            for (const auto& item : g_custom_music_catalog) {
-                if (!ContainsIgnoreCase(item.music_name, music_name)) {
-                    continue;
-                }
-                if (!author_name.empty() && !ContainsIgnoreCase(item.author_name, author_name)) {
-                    continue;
-                }
+            auto result = FilterCatalogByKeyword(music_name, author_name);
+            for (const auto& item : result) {
                 cJSON_AddItemToArray(result_list, BuildCustomMusicJson(item));
             }
             cJSON_AddNumberToObject(root, "result_count", cJSON_GetArraySize(result_list));
@@ -438,8 +686,8 @@ void McpServer::AddCommonTools() {
         "Play music from custom catalog using IDs from `search_custom_music`.\n"
         "Call `search_custom_music` first.\n"
         "Args:\n"
-        "  `id_list`: music ID list string (comma/space-separated or JSON array string). Prefer passing at least 2 IDs.\n"
-        "  `music_name`: the music name from search results",
+        "  `id_list`: music ID list string (comma/space-separated or JSON array string). Keep the list order.\n"
+        "  `music_name`: optional music name for fuzzy filter. If multiple tracks match, the first one is selected.",
         PropertyList({
             Property("id_list", kPropertyTypeString),
             Property("music_name", kPropertyTypeString, std::string(""))
@@ -451,40 +699,147 @@ void McpServer::AddCommonTools() {
             }
 
             auto requested_name = TrimCopy(properties["music_name"].value<std::string>());
-            std::vector<const CustomMusicItem*> candidates;
-            candidates.reserve(id_list.size());
-            for (const auto& id : id_list) {
-                auto* item = FindCustomMusicById(id);
-                if (item == nullptr) {
-                    continue;
-                }
-                if (!requested_name.empty() && !ContainsIgnoreCase(item->music_name, requested_name)) {
-                    continue;
-                }
-                candidates.push_back(item);
-            }
+            auto candidates = BuildPlaylistFromIdList(id_list, requested_name);
 
             if (candidates.empty()) {
                 throw std::runtime_error("No playable tracks found in local catalog for given id_list");
             }
 
-            size_t selected_index = 0;
-            if (candidates.size() > 1) {
-                selected_index = static_cast<size_t>(esp_random()) % candidates.size();
+            g_music_session.playlist = candidates;
+            g_music_session.history.clear();
+            g_music_session.current_index = -1;
+            g_music_session.paused = false;
+            g_music_session.last_error.clear();
+
+            std::string error_message;
+            if (!StartPlaylistTrackByIndex(0, true, true, &error_message)) {
+                throw std::runtime_error(error_message.empty() ? "Failed to play selected custom music URL" : error_message);
             }
-            const auto* selected = candidates[selected_index];
 
             auto& app = Application::GetInstance();
-            if (!app.PlayMusicUrl(selected->url)) {
-                throw std::runtime_error("Failed to play selected custom music URL");
-            }
-
-            g_current_custom_music = *selected;
-
             auto* root = cJSON_CreateObject();
             cJSON_AddBoolToObject(root, "ok", true);
             cJSON_AddNumberToObject(root, "candidate_count", SafeSizeToInt(candidates.size()));
-            cJSON_AddItemToObject(root, "selected_music", BuildCustomMusicJson(*selected));
+            cJSON_AddItemToObject(root, "selected_music", BuildCustomMusicJson(candidates.front()));
+            cJSON_AddItemToObject(root, "music", app.GetMusicStatusJson());
+            AddCustomMusicMetaToJson(root);
+            return root;
+        });
+
+    AddTool("self.music.control",
+        "Control music mode and the current playlist.\n"
+        "Supported actions:\n"
+        "  `pause` / `暂停`: stop current track but keep music mode and current playlist.\n"
+        "  `resume` / `continue` / `继续` / `恢复`: continue previous playlist from the current track beginning.\n"
+        "  `next` / `下一首`: play next track in order.\n"
+        "  `prev` / `上一首`: play previously played track from history.\n"
+        "  `play_index`: play Nth track in current playlist (1-based).\n"
+        "  `play_name`: fuzzy match track name in current playlist (or latest catalog if no active playlist), select first hit.\n"
+        "  `exit` / `退出音乐模式`: stop playback and exit music mode.\n"
+        "  `enter_dialog` / `进入对话模式`: exit music mode and enter dialogue listening mode.\n"
+        "  `status`: return current music status only.",
+        PropertyList({
+            Property("action", kPropertyTypeString),
+            Property("index", kPropertyTypeInteger, 1, 1, 9999),
+            Property("music_name", kPropertyTypeString, std::string(""))
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto action = NormalizeMusicControlAction(properties["action"].value<std::string>());
+            auto& app = Application::GetInstance();
+
+            if (action == "status") {
+                auto* root = cJSON_CreateObject();
+                cJSON_AddStringToObject(root, "action", "status");
+                cJSON_AddItemToObject(root, "music", app.GetMusicStatusJson());
+                AddCustomMusicMetaToJson(root);
+                return root;
+            } else if (action == "pause") {
+                StopMusicForSession(false, true);
+                g_music_session.mode_active = true;
+            } else if (action == "resume" || action == "continue") {
+                if (g_music_session.playlist.empty() || g_music_session.current_index < 0 ||
+                    static_cast<size_t>(g_music_session.current_index) >= g_music_session.playlist.size()) {
+                    throw std::runtime_error("没有可继续播放的歌曲，请先点歌。");
+                }
+                std::string error_message;
+                if (!StartPlaylistTrackByIndex(static_cast<size_t>(g_music_session.current_index), true, false, &error_message)) {
+                    throw std::runtime_error(error_message.empty() ? "继续播放失败" : error_message);
+                }
+            } else if (action == "next") {
+                if (g_music_session.playlist.empty()) {
+                    throw std::runtime_error("当前没有可播放歌单，请先点歌。");
+                }
+                size_t target_index = 0;
+                if (g_music_session.current_index >= 0 &&
+                    static_cast<size_t>(g_music_session.current_index) < g_music_session.playlist.size()) {
+                    target_index = static_cast<size_t>(g_music_session.current_index) + 1;
+                    if (target_index >= g_music_session.playlist.size()) {
+                        throw std::runtime_error("当前已是最后一首");
+                    }
+                }
+                std::string error_message;
+                if (!StartPlaylistTrackByIndex(target_index, true, true, &error_message)) {
+                    throw std::runtime_error(error_message.empty() ? "下一首播放失败" : error_message);
+                }
+            } else if (action == "prev" || action == "previous") {
+                if (g_music_session.history.size() < 2) {
+                    throw std::runtime_error("没有上一首");
+                }
+                g_music_session.history.pop_back();
+                size_t target_index = g_music_session.history.back();
+                std::string error_message;
+                if (!StartPlaylistTrackByIndex(target_index, true, false, &error_message)) {
+                    throw std::runtime_error(error_message.empty() ? "上一首播放失败" : error_message);
+                }
+            } else if (action == "play_index") {
+                if (g_music_session.playlist.empty()) {
+                    throw std::runtime_error("当前没有可播放歌单，请先点歌。");
+                }
+                int index = properties["index"].value<int>();
+                if (index < 1 || static_cast<size_t>(index) > g_music_session.playlist.size()) {
+                    throw std::runtime_error("没有第" + std::to_string(index) + "首，请说1到" +
+                        std::to_string(g_music_session.playlist.size()) + "之间的数字");
+                }
+                std::string error_message;
+                if (!StartPlaylistTrackByIndex(static_cast<size_t>(index - 1), true, true, &error_message)) {
+                    throw std::runtime_error(error_message.empty() ? "按序号播放失败" : error_message);
+                }
+            } else if (action == "play_name") {
+                auto music_name = TrimCopy(properties["music_name"].value<std::string>());
+                if (music_name.empty()) {
+                    throw std::runtime_error("music_name cannot be empty");
+                }
+
+                int index = FindFirstMatchIndex(g_music_session.playlist, music_name);
+                if (index >= 0) {
+                    std::string error_message;
+                    if (!StartPlaylistTrackByIndex(static_cast<size_t>(index), true, true, &error_message)) {
+                        throw std::runtime_error(error_message.empty() ? "按名称播放失败" : error_message);
+                    }
+                } else {
+                    auto matches = FilterCatalogByKeyword(music_name, "");
+                    if (matches.empty()) {
+                        throw std::runtime_error("当前列表没有这首，请说出正确歌曲名称。");
+                    }
+                    g_music_session.playlist = matches;
+                    g_music_session.history.clear();
+                    g_music_session.current_index = -1;
+                    std::string error_message;
+                    if (!StartPlaylistTrackByIndex(0, true, true, &error_message)) {
+                        throw std::runtime_error(error_message.empty() ? "按名称播放失败" : error_message);
+                    }
+                }
+            } else if (action == "exit") {
+                StopMusicForSession(true, false);
+            } else if (action == "enter_dialog") {
+                StopMusicForSession(true, false);
+                app.StartListening();
+            } else {
+                throw std::runtime_error("Unsupported action for self.music.control");
+            }
+
+            auto* root = cJSON_CreateObject();
+            cJSON_AddStringToObject(root, "action", action.c_str());
             cJSON_AddItemToObject(root, "music", app.GetMusicStatusJson());
             AddCustomMusicMetaToJson(root);
             return root;

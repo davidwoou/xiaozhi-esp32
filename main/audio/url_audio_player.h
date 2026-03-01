@@ -26,7 +26,7 @@ public:
     explicit UrlAudioPlayer(AudioService& audio_service);
     ~UrlAudioPlayer();
 
-    bool Play(const std::string& url);
+    bool Play(const std::string& url, const std::string& track_name = "");
     bool Stop();
     bool IsPlaying() const;
     cJSON* GetStatusJson() const;
@@ -40,6 +40,7 @@ private:
     bool playing_ = false;
     bool stopping_ = false;
     std::string current_url_;
+    std::string current_track_name_;
     std::string current_format_ = "unknown";
     std::string state_ = "idle";
     std::string last_error_;
@@ -54,13 +55,14 @@ private:
 
     void SetError(const std::string& message);
     Format DetectFormat(const std::string& url, const std::string& content_type) const;
-    bool DecodeWithSimpleDecoder(Format format);
-    bool DecodeOggOpus();
+    bool DecodeWithSimpleDecoder(Format format, const uint8_t* initial_data, size_t initial_size);
+    bool DecodeOggOpus(const uint8_t* initial_data, size_t initial_size);
 
     bool EnsureResampler(int src_rate, int dst_rate, int channels);
     bool ConvertToOutputPcm(const uint8_t* buffer, size_t buffer_size,
         int sample_rate, int channels, int bits_per_sample,
         std::vector<int16_t>& output);
+    void ApplyPlaybackAttenuation(std::vector<int16_t>& pcm) const;
 };
 
 #endif  // URL_AUDIO_PLAYER_H

@@ -26,6 +26,7 @@
 namespace {
 
 const char* TAG = "UrlAudioPlayer";
+constexpr int kMusicPlaybackGainPercent = 58;
 
 std::string ToLowerCopy(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
@@ -42,6 +43,95 @@ std::string GetUrlExtension(const std::string& url) {
         return "";
     }
     return ToLowerCopy(path.substr(dot + 1));
+}
+
+bool IsAbsoluteUrl(const std::string& value) {
+    return value.rfind("http://", 0) == 0 || value.rfind("https://", 0) == 0;
+}
+
+std::string GetUrlOrigin(const std::string& url) {
+    auto scheme_pos = url.find("://");
+    if (scheme_pos == std::string::npos) {
+        return "";
+    }
+    auto authority_start = scheme_pos + 3;
+    auto path_start = url.find('/', authority_start);
+    if (path_start == std::string::npos) {
+        return url;
+    }
+    return url.substr(0, path_start);
+}
+
+std::string GetUrlBasePath(const std::string& url) {
+    auto origin = GetUrlOrigin(url);
+    if (origin.empty()) {
+        return "";
+    }
+
+    auto path_start = url.find('/', origin.size());
+    if (path_start == std::string::npos) {
+        return origin + "/";
+    }
+
+    auto query_pos = url.find_first_of("?#", path_start);
+    auto path_with_file = query_pos == std::string::npos ? url.substr(path_start) : url.substr(path_start, query_pos - path_start);
+    auto slash_pos = path_with_file.find_last_of('/');
+    if (slash_pos == std::string::npos) {
+        return origin + "/";
+    }
+    return origin + path_with_file.substr(0, slash_pos + 1);
+}
+
+std::string ResolveRedirectUrl(const std::string& current_url, const std::string& location) {
+    if (location.empty()) {
+        return "";
+    }
+    if (IsAbsoluteUrl(location)) {
+        return location;
+    }
+    auto origin = GetUrlOrigin(current_url);
+    if (origin.empty()) {
+        return "";
+    }
+    if (!location.empty() && location.front() == '/') {
+        return origin + location;
+    }
+    auto base = GetUrlBasePath(current_url);
+    if (base.empty()) {
+        return "";
+    }
+    return base + location;
+}
+
+bool IsLikelyMp3Header(const uint8_t* data, size_t size) {
+    if (data == nullptr || size < 3) {
+        return false;
+    }
+    if (data[0] == 'I' && data[1] == 'D' && data[2] == '3') {
+        return true;
+    }
+    if (size >= 2 && data[0] == 0xFF && (data[1] & 0xE0) == 0xE0) {
+        return true;
+    }
+    return false;
+}
+
+UrlAudioPlayer::Format DetectFormatFromProbeData(const uint8_t* data, size_t size) {
+    if (data == nullptr || size < 4) {
+        return UrlAudioPlayer::Format::kUnknown;
+    }
+    if (size >= 12 &&
+        data[0] == 'R' && data[1] == 'I' && data[2] == 'F' && data[3] == 'F' &&
+        data[8] == 'W' && data[9] == 'A' && data[10] == 'V' && data[11] == 'E') {
+        return UrlAudioPlayer::Format::kWav;
+    }
+    if (data[0] == 'O' && data[1] == 'g' && data[2] == 'g' && data[3] == 'S') {
+        return UrlAudioPlayer::Format::kOgg;
+    }
+    if (IsLikelyMp3Header(data, size)) {
+        return UrlAudioPlayer::Format::kMp3;
+    }
+    return UrlAudioPlayer::Format::kUnknown;
 }
 
 int GetOpusSamplesPerFrame(const uint8_t* packet, int sample_rate) {
@@ -153,7 +243,7 @@ UrlAudioPlayer::~UrlAudioPlayer() {
     }
 }
 
-bool UrlAudioPlayer::Play(const std::string& url) {
+bool UrlAudioPlayer::Play(const std::string& url, const std::string& track_name) {
     if (url.empty()) {
         SetError("URL is empty");
         return false;
@@ -167,6 +257,7 @@ bool UrlAudioPlayer::Play(const std::string& url) {
     playing_ = true;
     stopping_ = false;
     current_url_ = url;
+    current_track_name_ = track_name.empty() ? url : track_name;
     current_format_ = "unknown";
     state_ = "starting";
     last_error_.clear();
@@ -233,6 +324,7 @@ cJSON* UrlAudioPlayer::GetStatusJson() const {
     cJSON_AddBoolToObject(root, "stopping", stopping_);
     cJSON_AddStringToObject(root, "state", state_.c_str());
     cJSON_AddStringToObject(root, "format", current_format_.c_str());
+    cJSON_AddStringToObject(root, "name", current_track_name_.c_str());
     cJSON_AddStringToObject(root, "url", current_url_.c_str());
     cJSON_AddBoolToObject(root, "streaming_reserved", true);
     if (!last_error_.empty()) {
@@ -269,20 +361,51 @@ void UrlAudioPlayer::PlaybackTask() {
         return;
     }
 
-    auto http = network->CreateHttp(2);
-    if (!http) {
-        SetError("Failed to create HTTP client");
-        std::lock_guard<std::mutex> lock(mutex_);
-        playing_ = false;
-        stopping_ = false;
-        state_ = "error";
-        return;
-    }
-    http->SetTimeout(10000);
-    http->SetKeepAlive(false);
+    constexpr int kMaxRedirects = 4;
+    std::unique_ptr<Http> http;
+    std::string request_url = url;
+    int redirect_count = 0;
+    bool http_ready = false;
+    while (!stop_requested_.load() && redirect_count <= kMaxRedirects) {
+        http = network->CreateHttp(2);
+        if (!http) {
+            SetError("Failed to create HTTP client");
+            break;
+        }
+        http->SetTimeout(15000);
+        http->SetKeepAlive(false);
 
-    if (!http->Open("GET", url)) {
-        SetError("Failed to open URL");
+        if (!http->Open("GET", request_url)) {
+            SetError("Failed to open URL");
+            break;
+        }
+
+        int status_code = http->GetStatusCode();
+        if (status_code >= 300 && status_code < 400) {
+            auto location = http->GetResponseHeader("Location");
+            if (location.empty()) {
+                location = http->GetResponseHeader("location");
+            }
+            auto resolved = ResolveRedirectUrl(request_url, location);
+            http->Close();
+            if (resolved.empty()) {
+                SetError("HTTP redirect without a valid Location header");
+                break;
+            }
+            request_url = resolved;
+            ++redirect_count;
+            continue;
+        }
+        if (status_code < 200 || status_code >= 300) {
+            SetError("HTTP status code: " + std::to_string(status_code));
+            http->Close();
+            break;
+        }
+        http_ready = true;
+        break;
+    }
+
+    if (!http_ready) {
         std::lock_guard<std::mutex> lock(mutex_);
         playing_ = false;
         stopping_ = false;
@@ -291,7 +414,32 @@ void UrlAudioPlayer::PlaybackTask() {
     }
 
     std::string content_type = ToLowerCopy(http->GetResponseHeader("Content-Type"));
-    Format format = DetectFormat(url, content_type);
+    Format format = DetectFormat(request_url, content_type);
+    std::vector<uint8_t> initial_probe;
+    if (format == Format::kUnknown) {
+        initial_probe.resize(512);
+        int probe_size = http->Read(reinterpret_cast<char*>(initial_probe.data()), initial_probe.size());
+        if (probe_size < 0) {
+            SetError("Failed to read audio stream");
+            http->Close();
+            std::lock_guard<std::mutex> lock(mutex_);
+            playing_ = false;
+            stopping_ = false;
+            state_ = "error";
+            return;
+        }
+        if (probe_size == 0) {
+            SetError("Audio stream is empty");
+            http->Close();
+            std::lock_guard<std::mutex> lock(mutex_);
+            playing_ = false;
+            stopping_ = false;
+            state_ = "error";
+            return;
+        }
+        initial_probe.resize(static_cast<size_t>(probe_size));
+        format = DetectFormatFromProbeData(initial_probe.data(), initial_probe.size());
+    }
     if (format == Format::kUnknown) {
         SetError("Unsupported audio format. Only wav/mp3/ogg are supported");
         http->Close();
@@ -305,15 +453,16 @@ void UrlAudioPlayer::PlaybackTask() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         active_http_ = http.get();
+        current_url_ = request_url;
         current_format_ = FormatToString(format);
         state_ = "playing";
     }
 
     bool success = false;
     if (format == Format::kOgg) {
-        success = DecodeOggOpus();
+        success = DecodeOggOpus(initial_probe.data(), initial_probe.size());
     } else {
-        success = DecodeWithSimpleDecoder(format);
+        success = DecodeWithSimpleDecoder(format, initial_probe.data(), initial_probe.size());
     }
 
     http->Close();
@@ -373,7 +522,7 @@ UrlAudioPlayer::Format UrlAudioPlayer::DetectFormat(const std::string& url, cons
     return Format::kUnknown;
 }
 
-bool UrlAudioPlayer::DecodeWithSimpleDecoder(Format format) {
+bool UrlAudioPlayer::DecodeWithSimpleDecoder(Format format, const uint8_t* initial_data, size_t initial_size) {
     RegisterSimpleDecoderDefaultsOnce();
 
     auto dec_type = ToSimpleDecoderType(format);
@@ -400,6 +549,7 @@ bool UrlAudioPlayer::DecodeWithSimpleDecoder(Format format) {
     esp_audio_simple_dec_info_t dec_info = {};
     bool have_info = false;
 
+    bool initial_chunk_pending = (initial_data != nullptr && initial_size > 0);
     while (!stop_requested_.load()) {
         Http* http = nullptr;
         {
@@ -412,7 +562,17 @@ bool UrlAudioPlayer::DecodeWithSimpleDecoder(Format format) {
             return false;
         }
 
-        int read_size = http->Read(reinterpret_cast<char*>(input_buffer.data()), input_buffer.size());
+        int read_size = 0;
+        if (initial_chunk_pending) {
+            if (input_buffer.size() < initial_size) {
+                input_buffer.resize(initial_size);
+            }
+            std::memcpy(input_buffer.data(), initial_data, initial_size);
+            read_size = static_cast<int>(initial_size);
+            initial_chunk_pending = false;
+        } else {
+            read_size = http->Read(reinterpret_cast<char*>(input_buffer.data()), input_buffer.size());
+        }
         if (read_size < 0) {
             esp_audio_simple_dec_close(decoder);
             SetError("HTTP read failed");
@@ -499,7 +659,7 @@ bool UrlAudioPlayer::DecodeWithSimpleDecoder(Format format) {
     return !stop_requested_.load();
 }
 
-bool UrlAudioPlayer::DecodeOggOpus() {
+bool UrlAudioPlayer::DecodeOggOpus(const uint8_t* initial_data, size_t initial_size) {
     OggDemuxer demuxer;
     demuxer.OnDemuxerFinished([this](const uint8_t* data, int sample_rate, size_t len) {
         if (stop_requested_.load() || data == nullptr || len == 0) {
@@ -511,6 +671,10 @@ bool UrlAudioPlayer::DecodeOggOpus() {
         packet->payload.assign(data, data + len);
         audio_service_.PushPacketToDecodeQueue(std::move(packet), true);
     });
+
+    if (initial_data != nullptr && initial_size > 0) {
+        demuxer.Process(initial_data, initial_size);
+    }
 
     std::vector<uint8_t> buffer(2048);
     while (!stop_requested_.load()) {
@@ -630,6 +794,7 @@ bool UrlAudioPlayer::ConvertToOutputPcm(const uint8_t* buffer, size_t buffer_siz
     int target_rate = codec->output_sample_rate();
     if (target_rate <= 0 || sample_rate == target_rate) {
         output = std::move(channel_converted);
+        ApplyPlaybackAttenuation(output);
         return true;
     }
 
@@ -652,5 +817,22 @@ bool UrlAudioPlayer::ConvertToOutputPcm(const uint8_t* buffer, size_t buffer_siz
         reinterpret_cast<esp_ae_sample_t>(resampled.data()), &actual_output);
     resampled.resize(actual_output * target_channels);
     output = std::move(resampled);
+    ApplyPlaybackAttenuation(output);
     return true;
+}
+
+void UrlAudioPlayer::ApplyPlaybackAttenuation(std::vector<int16_t>& pcm) const {
+    if (pcm.empty() || kMusicPlaybackGainPercent >= 100) {
+        return;
+    }
+
+    for (auto& sample : pcm) {
+        int scaled = (static_cast<int>(sample) * kMusicPlaybackGainPercent) / 100;
+        if (scaled > 32767) {
+            scaled = 32767;
+        } else if (scaled < -32768) {
+            scaled = -32768;
+        }
+        sample = static_cast<int16_t>(scaled);
+    }
 }

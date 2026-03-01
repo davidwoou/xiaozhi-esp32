@@ -114,7 +114,7 @@ public:
     void SetAecMode(AecMode mode);
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
-    bool PlayMusicUrl(const std::string& url);
+    bool PlayMusicUrl(const std::string& url, const std::string& track_name = "");
     bool StopMusic();
     bool IsMusicPlaying() const { return url_audio_player_.IsPlaying(); }
     cJSON* GetMusicStatusJson() const { return url_audio_player_.GetStatusJson(); }
@@ -155,6 +155,8 @@ private:
     int last_countdown_ui_second_ = -1;
     TaskHandle_t activation_task_handle_ = nullptr;
     UrlAudioPlayer url_audio_player_;
+    std::deque<std::unique_ptr<AudioStreamPacket>> pending_tts_audio_packets_;
+    bool pending_tts_state_switch_ = false;
 
 
     // Event handlers
@@ -180,6 +182,9 @@ private:
     void InitializeProtocol();
     void ShowActivationCode(const std::string& code, const std::string& message);
     void PlayAlarmSound(bool interrupt_playback);
+    void RefreshCountdownOverlay();
+    void FlushPendingTtsAudioPackets();
+    void ClearPendingTtsAudioPackets();
     bool StopLocalAlertFromButton();
     void SetListeningMode(ListeningMode mode);
     ListeningMode GetDefaultListeningMode() const;
