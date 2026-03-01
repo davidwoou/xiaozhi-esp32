@@ -7,9 +7,64 @@
 #include <esp_mn_iface.h>
 #include <esp_mn_models.h>
 #include <esp_mn_speech_commands.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+#include <flite_g2p.h>
+#ifdef __cplusplus
+}
+#endif
 #include <cJSON.h>
+#include <cstdlib>
 
 #define TAG "CustomWakeWord"
+
+namespace {
+
+bool IsEnglishLanguage(const std::string& language) {
+    return language == ESP_MN_ENGLISH || language.rfind("en", 0) == 0;
+}
+
+esp_err_t RegisterSpeechCommand(int command_id, const std::string& language,
+    const std::string& command_text) {
+    if (!IsEnglishLanguage(language)) {
+        return esp_mn_commands_add(command_id, command_text.c_str());
+    }
+
+    char* phonemes = flite_g2p(command_text.c_str(), 1);
+    if (phonemes == nullptr) {
+        ESP_LOGW(TAG, "Failed to generate phonemes for '%s', falling back to plain registration",
+            command_text.c_str());
+        return esp_mn_commands_add(command_id, command_text.c_str());
+    }
+
+    ESP_LOGI(TAG, "Registering english command '%s' with phonemes '%s'",
+        command_text.c_str(), phonemes);
+    auto ret = esp_mn_commands_phoneme_add(command_id, command_text.c_str(), phonemes);
+    free(phonemes);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to register english command '%s' with phonemes, falling back to plain registration",
+            command_text.c_str());
+        ret = esp_mn_commands_add(command_id, command_text.c_str());
+    }
+    return ret;
+}
+
+bool HasCommandUpdateErrors(const esp_mn_error_t* errors) {
+    if (errors == nullptr || errors->num <= 0 || errors->phrases == nullptr) {
+        return false;
+    }
+
+    for (int i = 0; i < errors->num; ++i) {
+        const auto* phrase = errors->phrases[i];
+        ESP_LOGE(TAG, "Rejected speech command: string='%s', phonemes='%s'",
+            phrase != nullptr && phrase->string != nullptr ? phrase->string : "(null)",
+            phrase != nullptr && phrase->phonemes != nullptr ? phrase->phonemes : "(null)");
+    }
+    return true;
+}
+
+}  // namespace
 
 CustomWakeWord::CustomWakeWord()
     : wake_word_pcm_(), wake_word_opus_() {
@@ -87,7 +142,10 @@ bool CustomWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) 
     commands_.clear();
 
     if (models_list == nullptr) {
-        language_ = "cn";
+        language_ = ESP_MN_CHINESE;
+#if CONFIG_SR_MN_EN_MULTINET5_SINGLE_RECOGNITION_QUANT8 || CONFIG_SR_MN_EN_MULTINET6_QUANT || CONFIG_SR_MN_EN_MULTINET7_QUANT
+        language_ = ESP_MN_ENGLISH;
+#endif
         models_ = esp_srmodel_init("model");
 #ifdef CONFIG_CUSTOM_WAKE_WORD
         threshold_ = CONFIG_CUSTOM_WAKE_WORD_THRESHOLD / 100.0f;
@@ -114,15 +172,28 @@ bool CustomWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) 
         ESP_LOGI(TAG, "Please refer to https://pcn7cs20v8cr.feishu.cn/wiki/CpQjwQsCJiQSWSkYEvrcxcbVnwh to add custom wake word");
         return false;
     }
+    ESP_LOGI(TAG, "Using multinet model '%s' for language '%s'", mn_name_, language_.c_str());
 
     multinet_ = esp_mn_handle_from_name(mn_name_);
     multinet_model_data_ = multinet_->create(mn_name_, duration_);
     multinet_->set_det_threshold(multinet_model_data_, threshold_);
+    if (commands_.empty()) {
+        ESP_LOGE(TAG, "No speech commands configured for custom wake word");
+        return false;
+    }
     esp_mn_commands_clear();
     for (int i = 0; i < commands_.size(); i++) {
-        esp_mn_commands_add(i + 1, commands_[i].command.c_str());
+        auto ret = RegisterSpeechCommand(i + 1, language_, commands_[i].command);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to register speech command '%s' (err=%d)",
+                commands_[i].command.c_str(), ret);
+            return false;
+        }
     }
-    esp_mn_commands_update();
+    auto* errors = esp_mn_commands_update();
+    if (HasCommandUpdateErrors(errors)) {
+        return false;
+    }
     
     multinet_->print_active_speech_commands(multinet_model_data_);
     return true;

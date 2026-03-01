@@ -49,6 +49,16 @@ void Display::ClearChatMessages() {
     // Default empty implementation, override in subclasses if needed
 }
 
+void Display::ShowCountdownOverlay(const char* primary_text, const char* secondary_text, bool urgent) {
+    ESP_LOGW(TAG, "ShowCountdownOverlay: %s / %s urgent=%d",
+        primary_text == nullptr ? "" : primary_text,
+        secondary_text == nullptr ? "" : secondary_text,
+        urgent);
+}
+
+void Display::HideCountdownOverlay() {
+}
+
 void Display::SetTheme(Theme* theme) {
     current_theme_ = theme;
     Settings settings("display", true);

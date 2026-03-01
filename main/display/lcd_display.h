@@ -32,11 +32,17 @@ protected:
     std::unique_ptr<LvglGif> gif_controller_ = nullptr;
     lv_obj_t* emoji_box_ = nullptr;
     lv_obj_t* chat_message_label_ = nullptr;
+    lv_obj_t* countdown_overlay_ = nullptr;
+    lv_obj_t* countdown_time_label_ = nullptr;
+    lv_obj_t* countdown_secondary_label_ = nullptr;
     esp_timer_handle_t preview_timer_ = nullptr;
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
     bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
+    bool countdown_overlay_urgent_ = false;
 
     void InitializeLcdThemes();
+    void SetupCountdownOverlay(const lv_font_t* text_font);
+    void UpdateCountdownAnimation(bool urgent);
     virtual bool Lock(int timeout_ms = 0) override;
     virtual void Unlock() override;
 
@@ -49,6 +55,8 @@ public:
     virtual void SetEmotion(const char* emotion) override;
     virtual void SetChatMessage(const char* role, const char* content) override;
     virtual void ClearChatMessages() override;
+    virtual void ShowCountdownOverlay(const char* primary_text, const char* secondary_text, bool urgent) override;
+    virtual void HideCountdownOverlay() override;
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override;
     virtual void SetupUI() override;
     // Add theme switching function

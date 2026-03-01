@@ -159,6 +159,38 @@ void EmoteDisplay::SetChatMessage(const char* const role, const char* const cont
     }
 }
 
+void EmoteDisplay::ShowCountdownOverlay(const char* primary_text, const char* secondary_text, bool urgent)
+{
+    (void)urgent;
+    if (!emote_handle_) {
+        return;
+    }
+
+    std::string message;
+    if (primary_text != nullptr && primary_text[0] != '\0') {
+        message = primary_text;
+    }
+    if (secondary_text != nullptr && secondary_text[0] != '\0') {
+        if (!message.empty()) {
+            message += " ";
+        }
+        message += secondary_text;
+    }
+    if (message.empty()) {
+        return;
+    }
+
+    emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SYS, message.c_str());
+}
+
+void EmoteDisplay::HideCountdownOverlay()
+{
+    if (!emote_handle_) {
+        return;
+    }
+    emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SYS, "");
+}
+
 void EmoteDisplay::SetStatus(const char* const status)
 {
     ESP_LOGI(TAG, "SetStatus: %s", status);

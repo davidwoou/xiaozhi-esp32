@@ -19,8 +19,100 @@
 
 #define TAG "Application"
 
+namespace {
 
-Application::Application() {
+std::string FormatCountdownClock(int total_seconds) {
+    if (total_seconds < 0) {
+        total_seconds = 0;
+    }
+
+    int hours = total_seconds / 3600;
+    int minutes = (total_seconds % 3600) / 60;
+    int seconds = total_seconds % 60;
+
+    char tail[6];
+    snprintf(tail, sizeof(tail), "%02d:%02d", minutes, seconds);
+    if (hours < 10) {
+        return std::string("0") + std::to_string(hours) + ":" + tail;
+    }
+    return std::to_string(hours) + ":" + tail;
+}
+
+std::string BuildCountdownOverlayPrimary(const CountdownInfo& countdown) {
+    int remaining = std::max(0, countdown.remaining_seconds);
+    if (remaining <= 60) {
+        return std::to_string(remaining);
+    }
+    return FormatCountdownClock(remaining);
+}
+
+std::string BuildCountdownOverlaySecondary(const CountdownInfo& countdown) {
+    int remaining = std::max(0, countdown.remaining_seconds);
+    auto full_clock = FormatCountdownClock(remaining);
+    if (remaining <= 60) {
+        if (countdown.label.empty()) {
+            return full_clock;
+        }
+        return full_clock + " " + countdown.label;
+    }
+    if (countdown.label.empty()) {
+        return "";
+    }
+    return countdown.label;
+}
+
+bool IsCountdownUrgent(const CountdownInfo& countdown) {
+    return countdown.remaining_seconds > 0 && countdown.remaining_seconds <= 60;
+}
+
+std::string BuildActiveCountdownMessage(const CountdownInfo& countdown) {
+    auto duration = FormatCountdownClock(countdown.remaining_seconds);
+    if (countdown.label.empty()) {
+        return std::string("Countdown ") + duration;
+    }
+    return std::string("Countdown ") + duration + " " + countdown.label;
+}
+
+std::string BuildActiveCountdownStatus(const CountdownInfo& countdown) {
+    return std::string("Timer ") + FormatCountdownClock(countdown.remaining_seconds);
+}
+
+std::string BuildCountdownMessage(const CountdownInfo& countdown) {
+    if (countdown.label.empty()) {
+        return "Timer finished";
+    }
+    return std::string("Timer finished ") + countdown.label;
+}
+
+std::string BuildAlarmMessage(const AlarmInfo& alarm) {
+    char time_buffer[6];
+    snprintf(time_buffer, sizeof(time_buffer), "%02d:%02d", alarm.hour, alarm.minute);
+    if (alarm.label.empty()) {
+        return std::string("Alarm ") + time_buffer;
+    }
+    return std::string("Alarm ") + time_buffer + " " + alarm.label;
+}
+
+std::string BuildNextAlarmMessage(const AlarmInfo& alarm) {
+    char time_buffer[32];
+    if (alarm.repeat == AlarmRepeatMode::kDaily) {
+        snprintf(time_buffer, sizeof(time_buffer), "Next alarm %02d:%02d daily", alarm.hour, alarm.minute);
+    } else {
+        snprintf(time_buffer, sizeof(time_buffer), "Next alarm %02d-%02d %02d:%02d",
+            alarm.month, alarm.day, alarm.hour, alarm.minute);
+    }
+
+    if (alarm.label.empty()) {
+        return time_buffer;
+    }
+    return std::string(time_buffer) + " " + alarm.label;
+}
+
+}  // namespace
+
+
+Application::Application()
+    : url_audio_player_(audio_service_) {
     event_group_ = xEventGroupCreate();
 
 #if CONFIG_USE_DEVICE_AEC && CONFIG_USE_SERVER_AEC
@@ -61,6 +153,7 @@ bool Application::SetDeviceState(DeviceState state) {
 void Application::Initialize() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
+    alarm_service_.Initialize();
 
     // Setup the display
     auto display = board.GetDisplay();
@@ -179,10 +272,16 @@ void Application::Run() {
         MAIN_EVENT_START_LISTENING |
         MAIN_EVENT_STOP_LISTENING |
         MAIN_EVENT_ACTIVATION_DONE |
-        MAIN_EVENT_STATE_CHANGED;
+        MAIN_EVENT_STATE_CHANGED |
+        MAIN_EVENT_STOP_LOCAL_ALERT;
 
     while (true) {
         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
+        bool local_alert_stopped = false;
+
+        if (bits & MAIN_EVENT_STOP_LOCAL_ALERT) {
+            local_alert_stopped = HandleStopLocalAlertEvent();
+        }
 
         if (bits & MAIN_EVENT_ERROR) {
             SetDeviceState(kDeviceStateIdle);
@@ -205,15 +304,15 @@ void Application::Run() {
             HandleStateChangedEvent();
         }
 
-        if (bits & MAIN_EVENT_TOGGLE_CHAT) {
+        if ((bits & MAIN_EVENT_TOGGLE_CHAT) && !local_alert_stopped) {
             HandleToggleChatEvent();
         }
 
-        if (bits & MAIN_EVENT_START_LISTENING) {
+        if ((bits & MAIN_EVENT_START_LISTENING) && !local_alert_stopped) {
             HandleStartListeningEvent();
         }
 
-        if (bits & MAIN_EVENT_STOP_LISTENING) {
+        if ((bits & MAIN_EVENT_STOP_LISTENING) && !local_alert_stopped) {
             HandleStopListeningEvent();
         }
 
@@ -225,7 +324,7 @@ void Application::Run() {
             }
         }
 
-        if (bits & MAIN_EVENT_WAKE_WORD_DETECTED) {
+        if ((bits & MAIN_EVENT_WAKE_WORD_DETECTED) && !local_alert_stopped) {
             HandleWakeWordDetectedEvent();
         }
 
@@ -246,15 +345,58 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
-            clock_ticks_++;
-            auto display = Board::GetInstance().GetDisplay();
-            display->UpdateStatusBar();
-        
-            // Print debug info every 10 seconds
-            if (clock_ticks_ % 10 == 0) {
-                SystemInfo::PrintHeapStats();
-            }
+            HandleClockTickEvent();
         }
+    }
+}
+
+void Application::RefreshIdleDisplay() {
+    if (GetDeviceState() != kDeviceStateIdle) {
+        return;
+    }
+
+    auto display = Board::GetInstance().GetDisplay();
+    if (alarm_service_.IsRinging()) {
+        last_countdown_ui_second_ = -1;
+        display->HideCountdownOverlay();
+        if (alarm_service_.IsCountdownRinging()) {
+            if (auto countdown = alarm_service_.GetCountdown(); countdown.has_value()) {
+                auto message = BuildCountdownMessage(*countdown);
+                display->SetStatus("Timer");
+                display->SetEmotion("bell");
+                display->SetChatMessage("system", message.c_str());
+            }
+            return;
+        }
+        if (auto ringing_alarm = alarm_service_.GetRingingAlarm(); ringing_alarm.has_value()) {
+            auto message = BuildAlarmMessage(*ringing_alarm);
+            display->SetStatus("Alarm");
+            display->SetEmotion("bell");
+            display->SetChatMessage("system", message.c_str());
+        }
+        return;
+    }
+
+    if (auto countdown = alarm_service_.GetCountdown(); countdown.has_value() && countdown->active) {
+        auto status = BuildActiveCountdownStatus(*countdown);
+        auto message = BuildActiveCountdownMessage(*countdown);
+        auto overlay_primary = BuildCountdownOverlayPrimary(*countdown);
+        auto overlay_secondary = BuildCountdownOverlaySecondary(*countdown);
+        display->SetStatus(status.c_str());
+        display->SetEmotion("neutral");
+        display->SetChatMessage("system", message.c_str());
+        display->ShowCountdownOverlay(overlay_primary.c_str(), overlay_secondary.c_str(), IsCountdownUrgent(*countdown));
+        last_countdown_ui_second_ = countdown->remaining_seconds;
+        return;
+    }
+
+    last_countdown_ui_second_ = -1;
+    display->HideCountdownOverlay();
+    if (auto next_alarm = alarm_service_.GetNextAlarm(); next_alarm.has_value()) {
+        auto message = BuildNextAlarmMessage(*next_alarm);
+        display->SetChatMessage("system", message.c_str());
+    } else {
+        display->SetChatMessage("system", "");
     }
 }
 
@@ -650,28 +792,85 @@ void Application::Alert(const char* status, const char* message, const char* emo
     }
 }
 
+void Application::PlayAlarmSound(bool interrupt_playback) {
+    if (url_audio_player_.IsPlaying()) {
+        url_audio_player_.Stop();
+    }
+    if (interrupt_playback) {
+        audio_service_.ResetDecoder();
+    } else if (!audio_service_.IsIdle()) {
+        return;
+    }
+
+    audio_service_.PlaySound(Lang::Sounds::OGG_NAOZHONG1);
+}
+
 void Application::DismissAlert() {
     if (GetDeviceState() == kDeviceStateIdle) {
         auto display = Board::GetInstance().GetDisplay();
+        display->HideCountdownOverlay();
         display->SetStatus(Lang::Strings::STANDBY);
         display->SetEmotion("neutral");
         display->SetChatMessage("system", "");
     }
 }
 
+bool Application::StopLocalAlertFromButton() {
+    bool handled = false;
+    if (alarm_service_.IsRinging()) {
+        alarm_service_.StopRinging();
+        handled = true;
+    }
+    if (alarm_service_.HasActiveCountdown()) {
+        alarm_service_.CancelCountdown();
+        handled = true;
+    }
+
+    if (!handled) {
+        return false;
+    }
+
+    url_audio_player_.Stop();
+    audio_service_.ResetDecoder();
+    DismissAlert();
+
+    if (protocol_ && protocol_->IsAudioChannelOpened()) {
+        protocol_->CloseAudioChannel();
+    }
+
+    auto state = GetDeviceState();
+    if (state == kDeviceStateConnecting ||
+        state == kDeviceStateListening ||
+        state == kDeviceStateSpeaking ||
+        state == kDeviceStateActivating) {
+        SetDeviceState(kDeviceStateIdle);
+    }
+
+    RefreshIdleDisplay();
+    return true;
+}
+
 void Application::ToggleChatState() {
-    xEventGroupSetBits(event_group_, MAIN_EVENT_TOGGLE_CHAT);
+    xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LOCAL_ALERT | MAIN_EVENT_TOGGLE_CHAT);
 }
 
 void Application::StartListening() {
-    xEventGroupSetBits(event_group_, MAIN_EVENT_START_LISTENING);
+    xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LOCAL_ALERT | MAIN_EVENT_START_LISTENING);
 }
 
 void Application::StopListening() {
-    xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING);
+    xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LOCAL_ALERT | MAIN_EVENT_STOP_LISTENING);
+}
+
+bool Application::HandleStopLocalAlertEvent() {
+    return StopLocalAlertFromButton();
 }
 
 void Application::HandleToggleChatEvent() {
+    if (StopLocalAlertFromButton()) {
+        return;
+    }
+
     auto state = GetDeviceState();
     
     if (state == kDeviceStateActivating) {
@@ -726,6 +925,10 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
 }
 
 void Application::HandleStartListeningEvent() {
+    if (StopLocalAlertFromButton()) {
+        return;
+    }
+
     auto state = GetDeviceState();
     
     if (state == kDeviceStateActivating) {
@@ -774,6 +977,14 @@ void Application::HandleStopListeningEvent() {
 }
 
 void Application::HandleWakeWordDetectedEvent() {
+    bool stopped_ringing = alarm_service_.StopRinging();
+    if (stopped_ringing) {
+        audio_service_.ResetDecoder();
+        DismissAlert();
+        RefreshIdleDisplay();
+        return;
+    }
+
     if (!protocol_) {
         return;
     }
@@ -860,6 +1071,10 @@ void Application::HandleStateChangedEvent() {
     auto display = board.GetDisplay();
     auto led = board.GetLed();
     led->OnStateChanged();
+    if (new_state != kDeviceStateIdle) {
+        last_countdown_ui_second_ = -1;
+        display->HideCountdownOverlay();
+    }
     
     switch (new_state) {
         case kDeviceStateUnknown:
@@ -869,6 +1084,7 @@ void Application::HandleStateChangedEvent() {
             display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
+            RefreshIdleDisplay();
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
@@ -923,6 +1139,71 @@ void Application::HandleStateChangedEvent() {
         default:
             // Do nothing
             break;
+    }
+}
+
+void Application::HandleClockTickEvent() {
+    clock_ticks_++;
+    auto display = Board::GetInstance().GetDisplay();
+    display->UpdateStatusBar();
+
+    auto alarm_tick = alarm_service_.Tick();
+    if (alarm_tick.triggered && alarm_tick.source != AlarmEventSource::kNone) {
+        last_countdown_tick_second_ = -1;
+        last_countdown_ui_second_ = -1;
+        if (GetDeviceState() == kDeviceStateSpeaking) {
+            AbortSpeaking(kAbortReasonNone);
+        }
+        if (protocol_ && protocol_->IsAudioChannelOpened()) {
+            protocol_->CloseAudioChannel();
+        }
+
+        if (alarm_tick.source == AlarmEventSource::kCountdown && alarm_tick.countdown.has_value()) {
+            auto message = BuildCountdownMessage(*alarm_tick.countdown);
+            Alert("Timer", message.c_str(), "bell");
+        } else if (alarm_tick.alarm.has_value()) {
+            auto message = BuildAlarmMessage(*alarm_tick.alarm);
+            Alert("Alarm", message.c_str(), "bell");
+        }
+        PlayAlarmSound(true);
+    } else if (alarm_tick.play_sound) {
+        PlayAlarmSound(false);
+    } else if (alarm_tick.auto_stopped) {
+        last_countdown_tick_second_ = -1;
+        last_countdown_ui_second_ = -1;
+        audio_service_.ResetDecoder();
+        DismissAlert();
+        RefreshIdleDisplay();
+    } else if (GetDeviceState() == kDeviceStateIdle && alarm_service_.HasActiveCountdown()) {
+        auto countdown = alarm_service_.GetCountdown();
+        if (countdown.has_value() && countdown->active) {
+            bool second_changed = countdown->remaining_seconds != last_countdown_ui_second_;
+            if (countdown->remaining_seconds > 0 &&
+                countdown->remaining_seconds <= 10 &&
+                countdown->remaining_seconds != last_countdown_tick_second_) {
+                last_countdown_tick_second_ = countdown->remaining_seconds;
+                if (audio_service_.IsIdle()) {
+                    audio_service_.PlaySound(Lang::Sounds::OGG_COUNTDOWN_TICK);
+                }
+            }
+            if (second_changed) {
+                RefreshIdleDisplay();
+            }
+        } else {
+            last_countdown_tick_second_ = -1;
+            last_countdown_ui_second_ = -1;
+            RefreshIdleDisplay();
+        }
+    } else if (!alarm_service_.HasActiveCountdown()) {
+        last_countdown_tick_second_ = -1;
+        if (last_countdown_ui_second_ != -1) {
+            last_countdown_ui_second_ = -1;
+            RefreshIdleDisplay();
+        }
+    }
+
+    if (clock_ticks_ % 10 == 0) {
+        SystemInfo::PrintHeapStats();
     }
 }
 
@@ -1017,6 +1298,11 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
 }
 
 void Application::WakeWordInvoke(const std::string& wake_word) {
+    if (alarm_service_.IsRinging() || alarm_service_.HasActiveCountdown()) {
+        xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LOCAL_ALERT);
+        return;
+    }
+
     if (!protocol_) {
         return;
     }
@@ -1102,6 +1388,45 @@ void Application::SetAecMode(AecMode mode) {
     });
 }
 
+bool Application::PlayMusicUrl(const std::string& url) {
+    if (url.empty()) {
+        return false;
+    }
+
+    if (alarm_service_.IsRinging()) {
+        alarm_service_.StopRinging();
+        DismissAlert();
+    }
+
+    auto state = GetDeviceState();
+    if (state == kDeviceStateSpeaking) {
+        AbortSpeaking(kAbortReasonNone);
+    }
+    if (protocol_ && protocol_->IsAudioChannelOpened()) {
+        protocol_->CloseAudioChannel();
+    }
+    if (state == kDeviceStateConnecting ||
+        state == kDeviceStateListening ||
+        state == kDeviceStateSpeaking) {
+        SetDeviceState(kDeviceStateIdle);
+    }
+
+    audio_service_.ResetDecoder();
+    bool started = url_audio_player_.Play(url);
+    if (started) {
+        RefreshIdleDisplay();
+    }
+    return started;
+}
+
+bool Application::StopMusic() {
+    bool stopped = url_audio_player_.Stop();
+    if (stopped && GetDeviceState() == kDeviceStateIdle) {
+        RefreshIdleDisplay();
+    }
+    return stopped;
+}
+
 void Application::PlaySound(const std::string_view& sound) {
     audio_service_.PlaySound(sound);
 }
@@ -1116,4 +1441,3 @@ void Application::ResetProtocol() {
         protocol_.reset();
     });
 }
-

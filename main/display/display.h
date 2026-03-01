@@ -36,6 +36,8 @@ public:
     virtual void SetEmotion(const char* emotion);
     virtual void SetChatMessage(const char* role, const char* content);
     virtual void ClearChatMessages();
+    virtual void ShowCountdownOverlay(const char* primary_text, const char* secondary_text, bool urgent);
+    virtual void HideCountdownOverlay();
     virtual void SetTheme(Theme* theme);
     virtual Theme* GetTheme() { return current_theme_; }
     virtual void UpdateStatusBar(bool update_all = false);

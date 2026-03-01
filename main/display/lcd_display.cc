@@ -22,6 +22,14 @@ LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 LV_FONT_DECLARE(BUILTIN_ICON_FONT);
 LV_FONT_DECLARE(font_awesome_30_4);
 
+namespace {
+
+void SetCountdownScale(void* obj, int32_t scale) {
+    lv_obj_set_style_transform_scale(static_cast<lv_obj_t*>(obj), scale, 0);
+}
+
+}  // namespace
+
 void LcdDisplay::InitializeLcdThemes() {
     auto text_font = std::make_shared<LvglBuiltInFont>(&BUILTIN_TEXT_FONT);
     auto icon_font = std::make_shared<LvglBuiltInFont>(&BUILTIN_ICON_FONT);
@@ -296,9 +304,21 @@ LcdDisplay::~LcdDisplay() {
         esp_timer_stop(preview_timer_);
         esp_timer_delete(preview_timer_);
     }
+    if (countdown_time_label_ != nullptr) {
+        lv_anim_delete(countdown_time_label_, SetCountdownScale);
+    }
 
     if (preview_image_ != nullptr) {
         lv_obj_del(preview_image_);
+    }
+    if (countdown_secondary_label_ != nullptr) {
+        lv_obj_del(countdown_secondary_label_);
+    }
+    if (countdown_time_label_ != nullptr) {
+        lv_obj_del(countdown_time_label_);
+    }
+    if (countdown_overlay_ != nullptr) {
+        lv_obj_del(countdown_overlay_);
     }
     if (chat_message_label_ != nullptr) {
         lv_obj_del(chat_message_label_);
@@ -348,6 +368,57 @@ bool LcdDisplay::Lock(int timeout_ms) {
 
 void LcdDisplay::Unlock() {
     lvgl_port_unlock();
+}
+
+void LcdDisplay::SetupCountdownOverlay(const lv_font_t* text_font) {
+    auto screen = lv_screen_active();
+    countdown_overlay_ = lv_obj_create(screen);
+    lv_obj_set_size(countdown_overlay_, LV_HOR_RES, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(countdown_overlay_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(countdown_overlay_, 0, 0);
+    lv_obj_set_style_pad_all(countdown_overlay_, 0, 0);
+    lv_obj_set_style_layout(countdown_overlay_, LV_LAYOUT_FLEX, 0);
+    lv_obj_set_flex_flow(countdown_overlay_, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(countdown_overlay_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(countdown_overlay_, 6, 0);
+    lv_obj_add_flag(countdown_overlay_, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+    lv_obj_align(countdown_overlay_, LV_ALIGN_CENTER, 0, text_font->line_height / 2);
+    lv_obj_add_flag(countdown_overlay_, LV_OBJ_FLAG_HIDDEN);
+
+    countdown_time_label_ = lv_label_create(countdown_overlay_);
+    lv_label_set_text(countdown_time_label_, "00:00:00");
+    lv_obj_set_style_text_align(countdown_time_label_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_transform_pivot_x(countdown_time_label_, 0, 0);
+    lv_obj_set_style_transform_pivot_y(countdown_time_label_, 0, 0);
+    lv_obj_set_style_transform_scale(countdown_time_label_, 256, 0);
+
+    countdown_secondary_label_ = lv_label_create(countdown_overlay_);
+    lv_label_set_text(countdown_secondary_label_, "");
+    lv_obj_set_style_text_align(countdown_secondary_label_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_flag(countdown_secondary_label_, LV_OBJ_FLAG_HIDDEN);
+}
+
+void LcdDisplay::UpdateCountdownAnimation(bool urgent) {
+    if (countdown_time_label_ == nullptr) {
+        return;
+    }
+    lv_anim_delete(countdown_time_label_, SetCountdownScale);
+
+    lv_anim_t anim;
+    lv_anim_init(&anim);
+    lv_anim_set_var(&anim, countdown_time_label_);
+    if (urgent) {
+        lv_anim_set_values(&anim, 448, 512);
+        lv_anim_set_duration(&anim, 260);
+    } else {
+        lv_anim_set_values(&anim, 256, 286);
+        lv_anim_set_duration(&anim, 900);
+    }
+    lv_anim_set_exec_cb(&anim, SetCountdownScale);
+    lv_anim_set_path_cb(&anim, lv_anim_path_ease_in_out);
+    lv_anim_set_playback_duration(&anim, urgent ? 240 : 900);
+    lv_anim_set_repeat_count(&anim, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_start(&anim);
 }
 
 #if CONFIG_USE_WECHAT_MESSAGE_STYLE
@@ -495,6 +566,8 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
     lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
     lv_label_set_text(emoji_label_, FONT_AWESOME_MICROCHIP_AI);
+
+    SetupCountdownOverlay(text_font);
 }
 #if CONFIG_IDF_TARGET_ESP32P4
 #define  MAX_MESSAGES 40
@@ -992,6 +1065,8 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_color(low_battery_label_, lv_color_white(), 0);
     lv_obj_center(low_battery_label_);
     lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
+
+    SetupCountdownOverlay(text_font);
 }
 
 void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
@@ -1003,7 +1078,9 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
 
     if (image == nullptr) {
         esp_timer_stop(preview_timer_);
-        lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+        if (emoji_box_ != nullptr && (countdown_overlay_ == nullptr || lv_obj_has_flag(countdown_overlay_, LV_OBJ_FLAG_HIDDEN))) {
+            lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+        }
         lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
         preview_image_cached_.reset();
         if (gif_controller_) {
@@ -1028,6 +1105,52 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
     esp_timer_stop(preview_timer_);
     ESP_ERROR_CHECK(esp_timer_start_once(preview_timer_, PREVIEW_IMAGE_DURATION_MS * 1000));
+}
+
+void LcdDisplay::ShowCountdownOverlay(const char* primary_text, const char* secondary_text, bool urgent) {
+    DisplayLockGuard lock(this);
+    if (countdown_overlay_ == nullptr || countdown_time_label_ == nullptr || countdown_secondary_label_ == nullptr) {
+        return;
+    }
+    bool was_hidden = lv_obj_has_flag(countdown_overlay_, LV_OBJ_FLAG_HIDDEN);
+
+    lv_label_set_text(countdown_time_label_, primary_text == nullptr ? "" : primary_text);
+    if (secondary_text == nullptr || secondary_text[0] == '\0') {
+        lv_label_set_text(countdown_secondary_label_, "");
+        lv_obj_add_flag(countdown_secondary_label_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_label_set_text(countdown_secondary_label_, secondary_text);
+        lv_obj_remove_flag(countdown_secondary_label_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    lv_obj_remove_flag(countdown_overlay_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(countdown_overlay_);
+    lv_obj_update_layout(countdown_time_label_);
+    lv_obj_set_style_transform_pivot_x(countdown_time_label_, lv_obj_get_width(countdown_time_label_) / 2, 0);
+    lv_obj_set_style_transform_pivot_y(countdown_time_label_, lv_obj_get_height(countdown_time_label_) / 2, 0);
+    if (emoji_box_ != nullptr) {
+        lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (urgent != countdown_overlay_urgent_ || was_hidden) {
+        countdown_overlay_urgent_ = urgent;
+        UpdateCountdownAnimation(urgent);
+    }
+}
+
+void LcdDisplay::HideCountdownOverlay() {
+    DisplayLockGuard lock(this);
+    if (countdown_overlay_ == nullptr || countdown_time_label_ == nullptr) {
+        return;
+    }
+    lv_obj_add_flag(countdown_overlay_, LV_OBJ_FLAG_HIDDEN);
+    lv_anim_delete(countdown_time_label_, SetCountdownScale);
+    lv_obj_set_style_transform_scale(countdown_time_label_, 256, 0);
+    countdown_overlay_urgent_ = false;
+
+    if (emoji_box_ != nullptr && preview_image_ != nullptr && lv_obj_has_flag(preview_image_, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 void LcdDisplay::SetChatMessage(const char* role, const char* content) {

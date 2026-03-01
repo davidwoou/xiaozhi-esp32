@@ -6,7 +6,10 @@
 #include "mcp_server.h"
 #include <esp_log.h>
 #include <esp_app_desc.h>
+#include <esp_random.h>
 #include <algorithm>
+#include <cctype>
+#include <climits>
 #include <cstring>
 #include <esp_pthread.h>
 
@@ -19,6 +22,178 @@
 #include "lvgl_display.h"
 
 #define TAG "MCP"
+
+namespace {
+
+struct CustomMusicItem {
+    std::string id;
+    std::string music_name;
+    std::string author_name;
+    std::string url;
+};
+
+std::vector<CustomMusicItem> g_custom_music_catalog;
+std::optional<CustomMusicItem> g_current_custom_music;
+
+int SafeSizeToInt(size_t value) {
+    if (value > static_cast<size_t>(INT_MAX)) {
+        return INT_MAX;
+    }
+    return static_cast<int>(value);
+}
+
+std::string TrimCopy(const std::string& value) {
+    size_t start = 0;
+    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
+        ++start;
+    }
+
+    size_t end = value.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+        --end;
+    }
+    return value.substr(start, end - start);
+}
+
+std::string ToLowerAsciiCopy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+bool ContainsIgnoreCase(const std::string& text, const std::string& keyword) {
+    if (keyword.empty()) {
+        return true;
+    }
+    auto lower_text = ToLowerAsciiCopy(text);
+    auto lower_keyword = ToLowerAsciiCopy(keyword);
+    return lower_text.find(lower_keyword) != std::string::npos;
+}
+
+std::string JsonValueToString(const cJSON* value) {
+    if (cJSON_IsString(value) && value->valuestring != nullptr) {
+        return value->valuestring;
+    }
+    if (cJSON_IsNumber(value)) {
+        return std::to_string(value->valueint);
+    }
+    return "";
+}
+
+std::string GetJsonStringByKeys(const cJSON* object, const std::initializer_list<const char*>& keys) {
+    if (!cJSON_IsObject(object)) {
+        return "";
+    }
+    for (auto* key : keys) {
+        auto* value = cJSON_GetObjectItem(object, key);
+        auto string_value = TrimCopy(JsonValueToString(value));
+        if (!string_value.empty()) {
+            return string_value;
+        }
+    }
+    return "";
+}
+
+cJSON* BuildCustomMusicJson(const CustomMusicItem& item) {
+    auto* json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "id", item.id.c_str());
+    cJSON_AddStringToObject(json, "music_name", item.music_name.c_str());
+    cJSON_AddStringToObject(json, "author_name", item.author_name.c_str());
+    cJSON_AddStringToObject(json, "url", item.url.c_str());
+    return json;
+}
+
+void UpsertCustomMusicItem(const CustomMusicItem& item) {
+    auto iter = std::find_if(g_custom_music_catalog.begin(), g_custom_music_catalog.end(),
+        [&item](const CustomMusicItem& existing) {
+            return existing.id == item.id;
+        });
+    if (iter == g_custom_music_catalog.end()) {
+        g_custom_music_catalog.push_back(item);
+    } else {
+        *iter = item;
+    }
+}
+
+const CustomMusicItem* FindCustomMusicById(const std::string& id) {
+    auto iter = std::find_if(g_custom_music_catalog.begin(), g_custom_music_catalog.end(),
+        [&id](const CustomMusicItem& item) {
+            return item.id == id;
+        });
+    if (iter == g_custom_music_catalog.end()) {
+        return nullptr;
+    }
+    return &(*iter);
+}
+
+std::vector<std::string> ParseIdList(const std::string& raw_id_list) {
+    std::vector<std::string> ids;
+    auto trimmed = TrimCopy(raw_id_list);
+    if (trimmed.empty()) {
+        return ids;
+    }
+
+    auto add_unique = [&ids](const std::string& id_value) {
+        auto id = TrimCopy(id_value);
+        if (id.empty()) {
+            return;
+        }
+        if (std::find(ids.begin(), ids.end(), id) == ids.end()) {
+            ids.push_back(id);
+        }
+    };
+
+    if (!trimmed.empty() && trimmed.front() == '[') {
+        auto* array_json = cJSON_Parse(trimmed.c_str());
+        if (cJSON_IsArray(array_json)) {
+            cJSON* item = nullptr;
+            cJSON_ArrayForEach(item, array_json) {
+                add_unique(JsonValueToString(item));
+            }
+            cJSON_Delete(array_json);
+            return ids;
+        }
+        cJSON_Delete(array_json);
+    }
+
+    std::string token;
+    for (char ch : trimmed) {
+        if (ch == ',' || ch == ';' || std::isspace(static_cast<unsigned char>(ch))) {
+            add_unique(token);
+            token.clear();
+        } else {
+            token.push_back(ch);
+        }
+    }
+    add_unique(token);
+    return ids;
+}
+
+void AddCustomMusicMetaToJson(cJSON* root) {
+    if (root == nullptr) {
+        return;
+    }
+    cJSON_AddNumberToObject(root, "custom_music_catalog_size", SafeSizeToInt(g_custom_music_catalog.size()));
+    if (g_current_custom_music.has_value()) {
+        cJSON_AddItemToObject(root, "current_custom_music", BuildCustomMusicJson(g_current_custom_music.value()));
+    }
+}
+
+cJSON* BuildDeviceStatusJson(Board& board, Application& app) {
+    auto* root = cJSON_Parse(board.GetDeviceStatusJson().c_str());
+    if (root == nullptr) {
+        throw std::runtime_error("Failed to parse device status JSON");
+    }
+    cJSON_AddItemToObject(root, "clock", app.GetAlarmService().GetClockJson());
+    cJSON_AddItemToObject(root, "alarm", app.GetAlarmService().GetStatusJson());
+    cJSON_AddItemToObject(root, "countdown", app.GetAlarmService().GetCountdownJson());
+    cJSON_AddItemToObject(root, "music", app.GetMusicStatusJson());
+    AddCustomMusicMetaToJson(root);
+    return root;
+}
+
+}  // namespace
 
 McpServer::McpServer() {
 }
@@ -49,7 +224,410 @@ void McpServer::AddCommonTools() {
         "2. As the first step to control the device (e.g. turn up / down the volume of the audio speaker, etc.)",
         PropertyList(),
         [&board](const PropertyList& properties) -> ReturnValue {
-            return board.GetDeviceStatusJson();
+            auto& app = Application::GetInstance();
+            return BuildDeviceStatusJson(board, app);
+        });
+
+    AddTool("self.alarm.get",
+        "Get local clock information and all local alarms stored on the device.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            auto* root = cJSON_CreateObject();
+            cJSON_AddItemToObject(root, "clock", app.GetAlarmService().GetClockJson());
+            cJSON_AddItemToObject(root, "alarm", app.GetAlarmService().GetStatusJson());
+            return root;
+        });
+
+    AddTool("self.countdown.get",
+        "Get the current local countdown state on the device.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            auto* root = cJSON_CreateObject();
+            cJSON_AddItemToObject(root, "countdown", app.GetAlarmService().GetCountdownJson());
+            return root;
+        });
+
+    AddTool("self.countdown.set",
+        "Start or replace a local countdown. `seconds` is the total countdown duration in seconds.",
+        PropertyList({
+            Property("seconds", kPropertyTypeInteger, 1, 86400),
+            Property("label", kPropertyTypeString, std::string(""))
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            bool was_ringing = app.GetAlarmService().IsCountdownRinging();
+            app.GetAlarmService().SetCountdown(
+                properties["seconds"].value<int>(),
+                properties["label"].value<std::string>());
+            if (was_ringing) {
+                app.GetAudioService().ResetDecoder();
+                app.DismissAlert();
+            }
+            app.RefreshIdleDisplay();
+
+            auto* root = cJSON_CreateObject();
+            cJSON_AddItemToObject(root, "countdown", app.GetAlarmService().GetCountdownJson());
+            return root;
+        });
+
+    auto cancel_countdown = [](const PropertyList& properties) -> ReturnValue {
+        auto& app = Application::GetInstance();
+        bool was_ringing = app.GetAlarmService().IsCountdownRinging();
+        bool cancelled = app.GetAlarmService().CancelCountdown();
+        if (was_ringing) {
+            app.GetAudioService().ResetDecoder();
+            app.DismissAlert();
+        }
+        app.RefreshIdleDisplay();
+
+        auto* root = cJSON_CreateObject();
+        cJSON_AddBoolToObject(root, "cancelled", cancelled);
+        cJSON_AddItemToObject(root, "countdown", app.GetAlarmService().GetCountdownJson());
+        return root;
+    };
+
+    AddTool("self.countdown.cancel",
+        "Cancel the current local countdown. If the countdown is ringing, this also stops the sound.",
+        PropertyList(),
+        cancel_countdown);
+
+    AddTool("self.countdown.stop",
+        "Stop the current local countdown. If the countdown is active it will be cancelled; if it is ringing it will also stop the sound.",
+        PropertyList(),
+        cancel_countdown);
+
+    AddTool("self.music.get",
+        "Get local URL music playback status on the device.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            auto* root = cJSON_CreateObject();
+            cJSON_AddItemToObject(root, "music", app.GetMusicStatusJson());
+            AddCustomMusicMetaToJson(root);
+            return root;
+        });
+
+    AddTool("self.music.play",
+        "Play a direct URL audio file from local MCP on the device. Supports wav/mp3/ogg URLs. "
+        "Streaming playback is reserved for future support and currently not available.",
+        PropertyList({
+            Property("url", kPropertyTypeString),
+            Property("streaming", kPropertyTypeBoolean, false)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            if (properties["streaming"].value<bool>()) {
+                throw std::runtime_error("Streaming playback is reserved and not implemented yet");
+            }
+
+            auto& app = Application::GetInstance();
+            if (!app.PlayMusicUrl(properties["url"].value<std::string>())) {
+                throw std::runtime_error("Failed to start local URL music playback");
+            }
+            g_current_custom_music.reset();
+
+            auto* root = cJSON_CreateObject();
+            cJSON_AddItemToObject(root, "music", app.GetMusicStatusJson());
+            AddCustomMusicMetaToJson(root);
+            return root;
+        });
+
+    AddTool("self.music.stop",
+        "Stop local URL music playback.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            bool stopped = app.StopMusic();
+            if (stopped) {
+                g_current_custom_music.reset();
+            }
+
+            auto* root = cJSON_CreateObject();
+            cJSON_AddBoolToObject(root, "stopped", stopped);
+            cJSON_AddItemToObject(root, "music", app.GetMusicStatusJson());
+            AddCustomMusicMetaToJson(root);
+            return root;
+        });
+
+    AddTool("self.music.catalog.push",
+        "Push or replace a custom music catalog to the device.\n"
+        "Pass `music_list_json` as a JSON array string. Each item should include id/music_id, music_name/name, author_name/author, and url.\n"
+        "After pushing, call `search_custom_music` and then `play_custom_music`.",
+        PropertyList({
+            Property("music_list_json", kPropertyTypeString),
+            Property("replace", kPropertyTypeBoolean, true)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            const auto music_list_json = properties["music_list_json"].value<std::string>();
+            auto* parsed = cJSON_Parse(music_list_json.c_str());
+            if (!cJSON_IsArray(parsed)) {
+                cJSON_Delete(parsed);
+                throw std::runtime_error("music_list_json must be a JSON array string");
+            }
+
+            if (properties["replace"].value<bool>()) {
+                g_custom_music_catalog.clear();
+                g_current_custom_music.reset();
+            }
+
+            int accepted = 0;
+            int skipped = 0;
+            cJSON* item = nullptr;
+            cJSON_ArrayForEach(item, parsed) {
+                CustomMusicItem music_item;
+                music_item.id = GetJsonStringByKeys(item, {"id", "music_id"});
+                music_item.music_name = GetJsonStringByKeys(item, {"music_name", "name", "title"});
+                music_item.author_name = GetJsonStringByKeys(item, {"author_name", "author", "artist"});
+                music_item.url = GetJsonStringByKeys(item, {"url", "play_url", "audio_url"});
+                if (music_item.id.empty() || music_item.music_name.empty() || music_item.url.empty()) {
+                    ++skipped;
+                    continue;
+                }
+                UpsertCustomMusicItem(music_item);
+                ++accepted;
+            }
+            cJSON_Delete(parsed);
+
+            auto* root = cJSON_CreateObject();
+            cJSON_AddBoolToObject(root, "ok", true);
+            cJSON_AddNumberToObject(root, "accepted", accepted);
+            cJSON_AddNumberToObject(root, "skipped", skipped);
+            AddCustomMusicMetaToJson(root);
+            return root;
+        });
+
+    AddTool("search_custom_music",
+        "Search music and get music IDs from the custom music catalog on the device.\n"
+        "Use this tool when the user asks to search or play music.\n"
+        "Args:\n"
+        "  `music_name`: the music name keyword to search\n"
+        "  `author_name`: optional author keyword to filter",
+        PropertyList({
+            Property("music_name", kPropertyTypeString),
+            Property("author_name", kPropertyTypeString, std::string(""))
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            const auto music_name = TrimCopy(properties["music_name"].value<std::string>());
+            const auto author_name = TrimCopy(properties["author_name"].value<std::string>());
+            if (music_name.empty()) {
+                throw std::runtime_error("music_name cannot be empty");
+            }
+
+            auto* root = cJSON_CreateObject();
+            cJSON_AddStringToObject(root, "music_name", music_name.c_str());
+            cJSON_AddStringToObject(root, "author_name", author_name.c_str());
+            cJSON_AddNumberToObject(root, "catalog_size", SafeSizeToInt(g_custom_music_catalog.size()));
+
+            auto* result_list = cJSON_CreateArray();
+            for (const auto& item : g_custom_music_catalog) {
+                if (!ContainsIgnoreCase(item.music_name, music_name)) {
+                    continue;
+                }
+                if (!author_name.empty() && !ContainsIgnoreCase(item.author_name, author_name)) {
+                    continue;
+                }
+                cJSON_AddItemToArray(result_list, BuildCustomMusicJson(item));
+            }
+            cJSON_AddNumberToObject(root, "result_count", cJSON_GetArraySize(result_list));
+            cJSON_AddItemToObject(root, "music_list", result_list);
+            return root;
+        });
+
+    AddTool("play_custom_music",
+        "Play music from custom catalog using IDs from `search_custom_music`.\n"
+        "Call `search_custom_music` first.\n"
+        "Args:\n"
+        "  `id_list`: music ID list string (comma/space-separated or JSON array string). Prefer passing at least 2 IDs.\n"
+        "  `music_name`: the music name from search results",
+        PropertyList({
+            Property("id_list", kPropertyTypeString),
+            Property("music_name", kPropertyTypeString, std::string(""))
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto id_list = ParseIdList(properties["id_list"].value<std::string>());
+            if (id_list.empty()) {
+                throw std::runtime_error("id_list is empty. Please provide IDs from search_custom_music");
+            }
+
+            auto requested_name = TrimCopy(properties["music_name"].value<std::string>());
+            std::vector<const CustomMusicItem*> candidates;
+            candidates.reserve(id_list.size());
+            for (const auto& id : id_list) {
+                auto* item = FindCustomMusicById(id);
+                if (item == nullptr) {
+                    continue;
+                }
+                if (!requested_name.empty() && !ContainsIgnoreCase(item->music_name, requested_name)) {
+                    continue;
+                }
+                candidates.push_back(item);
+            }
+
+            if (candidates.empty()) {
+                throw std::runtime_error("No playable tracks found in local catalog for given id_list");
+            }
+
+            size_t selected_index = 0;
+            if (candidates.size() > 1) {
+                selected_index = static_cast<size_t>(esp_random()) % candidates.size();
+            }
+            const auto* selected = candidates[selected_index];
+
+            auto& app = Application::GetInstance();
+            if (!app.PlayMusicUrl(selected->url)) {
+                throw std::runtime_error("Failed to play selected custom music URL");
+            }
+
+            g_current_custom_music = *selected;
+
+            auto* root = cJSON_CreateObject();
+            cJSON_AddBoolToObject(root, "ok", true);
+            cJSON_AddNumberToObject(root, "candidate_count", SafeSizeToInt(candidates.size()));
+            cJSON_AddItemToObject(root, "selected_music", BuildCustomMusicJson(*selected));
+            cJSON_AddItemToObject(root, "music", app.GetMusicStatusJson());
+            AddCustomMusicMetaToJson(root);
+            return root;
+        });
+
+    AddTool("self.alarm.set",
+        "Set or update a local alarm using the device's local time.\n"
+        "Use repeat=`once` for a one-time alarm and repeat=`daily` for a recurring alarm.\n"
+        "If the user gives a specific date, pass year/month/day. If updating an existing alarm, pass alarm_id.\n"
+        "Before converting relative times like tomorrow morning, call `self.get_device_status` or `self.alarm.get` to read the current local time.",
+        PropertyList({
+            Property("hour", kPropertyTypeInteger, 0, 23),
+            Property("minute", kPropertyTypeInteger, 0, 59),
+            Property("repeat", kPropertyTypeString, std::string("once")),
+            Property("label", kPropertyTypeString, std::string("")),
+            Property("alarm_id", kPropertyTypeInteger, 0, 0, 9999),
+            Property("year", kPropertyTypeInteger, 0, 0, 2099),
+            Property("month", kPropertyTypeInteger, 0, 0, 12),
+            Property("day", kPropertyTypeInteger, 0, 0, 31)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            app.GetAlarmService().SetAlarm(
+                properties["hour"].value<int>(),
+                properties["minute"].value<int>(),
+                properties["repeat"].value<std::string>(),
+                properties["label"].value<std::string>(),
+                properties["alarm_id"].value<int>(),
+                properties["year"].value<int>(),
+                properties["month"].value<int>(),
+                properties["day"].value<int>());
+            app.RefreshIdleDisplay();
+
+            auto* root = cJSON_CreateObject();
+            cJSON_AddItemToObject(root, "clock", app.GetAlarmService().GetClockJson());
+            cJSON_AddItemToObject(root, "alarm", app.GetAlarmService().GetStatusJson());
+            return root;
+        });
+
+    AddTool("self.alarm.enable",
+        "Enable a local alarm by alarm_id.",
+        PropertyList({
+            Property("alarm_id", kPropertyTypeInteger, 1, 9999)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            if (!app.GetAlarmService().SetAlarmEnabled(properties["alarm_id"].value<int>(), true)) {
+                throw std::runtime_error("Alarm not found");
+            }
+            app.RefreshIdleDisplay();
+
+            auto* root = cJSON_CreateObject();
+            cJSON_AddItemToObject(root, "alarm", app.GetAlarmService().GetStatusJson());
+            return root;
+        });
+
+    AddTool("self.alarm.disable",
+        "Disable a local alarm by alarm_id.",
+        PropertyList({
+            Property("alarm_id", kPropertyTypeInteger, 1, 9999)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            auto ringing_alarm = app.GetAlarmService().GetRingingAlarm();
+            bool was_ringing = ringing_alarm.has_value() &&
+                ringing_alarm->id == properties["alarm_id"].value<int>();
+            if (!app.GetAlarmService().SetAlarmEnabled(properties["alarm_id"].value<int>(), false)) {
+                throw std::runtime_error("Alarm not found");
+            }
+            if (was_ringing) {
+                app.GetAudioService().ResetDecoder();
+            }
+            app.DismissAlert();
+            app.RefreshIdleDisplay();
+
+            auto* root = cJSON_CreateObject();
+            cJSON_AddItemToObject(root, "alarm", app.GetAlarmService().GetStatusJson());
+            return root;
+        });
+
+    AddTool("self.alarm.snooze",
+        "Snooze the currently ringing local alarm. Supported snooze values are 5 or 10 minutes.",
+        PropertyList({
+            Property("minutes", kPropertyTypeInteger, 5, 5, 10)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto minutes = properties["minutes"].value<int>();
+            if (minutes != 5 && minutes != 10) {
+                throw std::runtime_error("Snooze minutes must be 5 or 10");
+            }
+
+            auto& app = Application::GetInstance();
+            app.GetAlarmService().SnoozeRingingAlarm(minutes);
+            app.GetAudioService().ResetDecoder();
+            app.DismissAlert();
+            app.RefreshIdleDisplay();
+
+            auto* root = cJSON_CreateObject();
+            cJSON_AddNumberToObject(root, "snoozed_minutes", minutes);
+            cJSON_AddItemToObject(root, "alarm", app.GetAlarmService().GetStatusJson());
+            return root;
+        });
+
+    AddTool("self.alarm.delete",
+        "Delete a local alarm by alarm_id.",
+        PropertyList({
+            Property("alarm_id", kPropertyTypeInteger, 1, 9999)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            auto ringing_alarm = app.GetAlarmService().GetRingingAlarm();
+            bool was_ringing = ringing_alarm.has_value() &&
+                ringing_alarm->id == properties["alarm_id"].value<int>();
+            if (!app.GetAlarmService().DeleteAlarm(properties["alarm_id"].value<int>())) {
+                throw std::runtime_error("Alarm not found");
+            }
+            if (was_ringing) {
+                app.GetAudioService().ResetDecoder();
+                app.DismissAlert();
+            }
+            app.RefreshIdleDisplay();
+
+            auto* root = cJSON_CreateObject();
+            cJSON_AddItemToObject(root, "alarm", app.GetAlarmService().GetStatusJson());
+            return root;
+        });
+
+    AddTool("self.alarm.stop",
+        "Stop the currently ringing local alarm.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            bool stopped = app.GetAlarmService().StopRinging();
+            if (stopped) {
+                app.GetAudioService().ResetDecoder();
+                app.DismissAlert();
+            }
+            app.RefreshIdleDisplay();
+
+            auto* root = cJSON_CreateObject();
+            cJSON_AddBoolToObject(root, "stopped", stopped);
+            cJSON_AddItemToObject(root, "alarm", app.GetAlarmService().GetStatusJson());
+            return root;
         });
 
     AddTool("self.audio_speaker.set_volume", 

@@ -13,7 +13,9 @@
 
 #include "protocol.h"
 #include "ota.h"
+#include "alarm_service.h"
 #include "audio_service.h"
+#include "url_audio_player.h"
 #include "device_state.h"
 #include "device_state_machine.h"
 
@@ -31,6 +33,7 @@
 #define MAIN_EVENT_START_LISTENING      (1 << 10)
 #define MAIN_EVENT_STOP_LISTENING       (1 << 11)
 #define MAIN_EVENT_STATE_CHANGED        (1 << 12)
+#define MAIN_EVENT_STOP_LOCAL_ALERT     (1 << 13)
 
 
 enum AecMode {
@@ -111,7 +114,13 @@ public:
     void SetAecMode(AecMode mode);
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
+    bool PlayMusicUrl(const std::string& url);
+    bool StopMusic();
+    bool IsMusicPlaying() const { return url_audio_player_.IsPlaying(); }
+    cJSON* GetMusicStatusJson() const { return url_audio_player_.GetStatusJson(); }
+    void RefreshIdleDisplay();
     AudioService& GetAudioService() { return audio_service_; }
+    AlarmService& GetAlarmService() { return alarm_service_; }
     
     /**
      * Reset protocol resources (thread-safe)
@@ -134,6 +143,7 @@ private:
     AecMode aec_mode_ = kAecOff;
     std::string last_error_message_;
     AudioService audio_service_;
+    AlarmService alarm_service_;
     std::unique_ptr<Ota> ota_;
 
     bool has_server_time_ = false;
@@ -141,7 +151,10 @@ private:
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     int clock_ticks_ = 0;
+    int last_countdown_tick_second_ = -1;
+    int last_countdown_ui_second_ = -1;
     TaskHandle_t activation_task_handle_ = nullptr;
+    UrlAudioPlayer url_audio_player_;
 
 
     // Event handlers
@@ -149,10 +162,12 @@ private:
     void HandleToggleChatEvent();
     void HandleStartListeningEvent();
     void HandleStopListeningEvent();
+    bool HandleStopLocalAlertEvent();
     void HandleNetworkConnectedEvent();
     void HandleNetworkDisconnectedEvent();
     void HandleActivationDoneEvent();
     void HandleWakeWordDetectedEvent();
+    void HandleClockTickEvent();
     void ContinueOpenAudioChannel(ListeningMode mode);
     void ContinueWakeWordInvoke(const std::string& wake_word);
 
@@ -164,6 +179,8 @@ private:
     void CheckNewVersion();
     void InitializeProtocol();
     void ShowActivationCode(const std::string& code, const std::string& message);
+    void PlayAlarmSound(bool interrupt_playback);
+    bool StopLocalAlertFromButton();
     void SetListeningMode(ListeningMode mode);
     ListeningMode GetDefaultListeningMode() const;
     
